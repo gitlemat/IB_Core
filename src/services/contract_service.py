@@ -131,8 +131,7 @@ class ContractResolutionService(IBBaseService):
             
         self.connector.in_flight_signatures.add(sig)
         
-        req_id = self.connector.next_req_id
-        self.connector.next_req_id += 1
+        req_id = self.connector.get_req_id()
         
         self.connector.pending_resolutions[req_id] = sig
         
@@ -183,8 +182,7 @@ class ContractResolutionService(IBBaseService):
                 continue
             self.connector.in_flight_signatures.add(sig)
             
-            req_id = self.connector.next_req_id
-            self.connector.next_req_id += 1
+            req_id = self.connector.get_req_id()
             
             self.connector.pending_resolutions[req_id] = sig
             
@@ -234,8 +232,7 @@ class ContractResolutionService(IBBaseService):
                 lc.exchange = l.get('exchange', get_exchange_for_product(lc.symbol))
                 lc.currency = l.get('currency', 'USD')
                 
-                req_id = self.connector.next_req_id
-                self.connector.next_req_id += 1
+                req_id = self.connector.get_req_id()
                 
                 event = threading.Event()
                 self.connector.resolution_events[req_id] = event

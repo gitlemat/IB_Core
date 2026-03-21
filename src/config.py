@@ -43,6 +43,7 @@ class Config:
     IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", 1))
 
     # InfluxDB Settings
+    ENABLE_INFLUXDB = os.getenv("ENABLE_INFLUXDB", "TRUE").upper() == "TRUE"
     INFLUXDB_URL = os.getenv("INFLUXDB_URL", "http://localhost:8086")
     INFLUXDB_TOKEN = os.getenv("INFLUXDB_TOKEN", "")
     INFLUXDB_ORG = os.getenv("INFLUXDB_ORG", "")

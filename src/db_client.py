@@ -24,21 +24,31 @@ class DatabaseClient:
     
     def __init__(self):
         self.logger = LoggerSetup.get_logger("DatabaseClient")
+        self.enabled = Config.ENABLE_INFLUXDB
         
-        try:
-            self.client = influxdb_client.InfluxDBClient(
-                url=Config.INFLUXDB_URL,
-                token=Config.INFLUXDB_TOKEN,
-                org=Config.INFLUXDB_ORG
-            )
-            self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
-            self.query_api = self.client.query_api()
-            self.org = Config.INFLUXDB_ORG
-            self.logger.info(f"Initialized InfluxDB Client for Org: {self.org}")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize InfluxDB Client: {e}")
-            self.client = None
-            self.write_api = None
+        self.client = None
+        self.write_api = None
+        self.query_api = None
+        
+        if self.enabled:
+            try:
+                self.client = influxdb_client.InfluxDBClient(
+                    url=Config.INFLUXDB_URL,
+                    token=Config.INFLUXDB_TOKEN,
+                    org=Config.INFLUXDB_ORG
+                )
+                self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
+                self.query_api = self.client.query_api()
+                self.org = Config.INFLUXDB_ORG
+                self.bucket_prices = Config.INFLUXDB_BUCKET_PRICES
+                self.bucket_data = Config.DATA_BUCKET
+                self.logger.info(f"Initialized InfluxDB Client for Org: {self.org} (Buckets: {self.bucket_prices}, {self.bucket_data})")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize InfluxDB Client: {e}")
+                self.client = None
+                self.write_api = None
+        else:
+            self.logger.info("InfluxDB is DISABLED by configuration.")
 
         # Buffer for accumulating ticks before write
         # Key: g_con_id, Value: AccumulatedTickRecord
@@ -79,7 +89,7 @@ class DatabaseClient:
 
     def start_monitor(self):
         """Starts the background flush monitor."""
-        if self.monitor_active: return
+        if not self.enabled or self.monitor_active: return
         
         self.monitor_active = True
         self.monitor_thread = threading.Thread(target=self._monitor_flush_loop, daemon=True)
@@ -298,10 +308,7 @@ class DatabaseClient:
         """
         Writes Reconciled Positions to InfluxDB.
         """
-        # Feature Disabled: User Requested 2026-02-11
-        # Reason: Complexity with BAGs/Legs causing data issues.
-        # self.logger.info("Skipping portfolio write (Disabled)")
-        return
+        if not self.enabled: return
 
         bucket = Config.DATA_BUCKET # Use the same active data bucket
         # Ideally, we check 'account' to decide bucket, but simplified here.
@@ -333,7 +340,7 @@ class DatabaseClient:
         Tags: accountId, symbol, orderId, permId
         Writes only fields present in order_data (excluding tags).
         """
-        bucket = Config.DATA_BUCKET
+        if not self.enabled or not self.write_api: return
         measurement = "orders"
         now = datetime.now(timezone.utc)
         
@@ -437,7 +444,7 @@ class DatabaseClient:
         """
         Queries InfluxDB for the last known state of specific orderIds.
         """
-        if not order_ids:
+        if not self.enabled or not self.query_api or not order_ids:
             return {}
             
         bucket = Config.DATA_BUCKET
@@ -448,7 +455,7 @@ class DatabaseClient:
         id_filter = ", ".join(id_strs)
         
         query = f'''
-    from(bucket: "{bucket}")
+    from(bucket: "{self.bucket_data}")
       |> range(start: -7d)
       |> filter(fn: (r) => r["_measurement"] == "{measurement}")
       |> filter(fn: (r) => contains(value: r["orderId"], set: [{id_filter}]))
@@ -505,7 +512,7 @@ class DatabaseClient:
         """
         Writes account summary to the appropriate bucket.
         """
-        bucket = Config.DATA_BUCKET
+        if not self.enabled or not self.write_api: return
         measurement = "account"
         
         point = Point(measurement) \
@@ -530,10 +537,10 @@ class DatabaseClient:
         Used for crash recovery or context merging.
         Returns: {'timestamp': datetime, 'tags': {Symbol: ..., AccountId: ..., PermId: ...}}
         """
-        bucket = Config.DATA_BUCKET
+        if not self.enabled or not self.query_api: return None
         # We need _time and the tags
         query = f'''
-        from(bucket: "{bucket}")
+        from(bucket: "{self.bucket_data}")
           |> range(start: -7d)
           |> filter(fn: (r) => r["_measurement"] == "executions")
           |> filter(fn: (r) => r["ExecId"] == "{exec_id}")
@@ -563,7 +570,7 @@ class DatabaseClient:
         Used for initializing PnL state in RODSIC_Strat.
         Returns a list of execution dicts sorted by time.
         """
-        bucket = Config.DATA_BUCKET
+        if not self.enabled or not self.query_api: return []
         
         # Base filter
         filters = []
@@ -578,7 +585,7 @@ class DatabaseClient:
         filter_str = " |> ".join([f'filter(fn: (r) => {f})' for f in filters])
         
         query = f'''
-        from(bucket: "{bucket}")
+        from(bucket: "{self.bucket_data}")
           |> range(start: {start})
           |> {filter_str}
           |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
@@ -612,8 +619,7 @@ class DatabaseClient:
         """
         Writes execution data.
         """
-        # Bucket auto-selected by Config based on APP_MODE
-        bucket = Config.DATA_BUCKET
+        if not self.enabled or not self.write_api: return
         measurement = "executions"
         
         # Use provided timestamp or current time
@@ -646,7 +652,7 @@ class DatabaseClient:
         Writes commission data to the SAME measurement as executions, linked by ExecId.
         To merge into the same series, timestamp AND ALL TAGS must match.
         """
-        bucket = Config.DATA_BUCKET
+        if not self.enabled or not self.write_api: return
         measurement = "executions"
         
         if not timestamp:
@@ -680,9 +686,9 @@ class DatabaseClient:
         Retrieves the timestamp of the most recent execution stored in InfluxDB.
         Used to filter out duplicates during startup reconciliation.
         """
-        bucket = Config.DATA_BUCKET
+        if not self.enabled or not self.query_api: return None
         query = f'''
-        from(bucket: "{bucket}")
+        from(bucket: "{self.bucket_data}")
           |> range(start: -30d) 
           |> filter(fn: (r) => r["_measurement"] == "executions")
           |> last()
@@ -699,18 +705,12 @@ class DatabaseClient:
     def get_recent_executions_context(self) -> List[Dict]:
         """
         Retrieves ALL recent executions (last 48h) to populate the memory cache.
-        
-        Why ALL and not just incomplete ones?
-        1. Robustness: Ensures we have the Context (Timestamp + Tags) for ANY late commission report, 
-           even if we thought the execution was "done".
-        2. Simplicity: Querying for "missing fields" in InfluxDB (Flux) is complex and slow.
-           Fetching recent history is fast and ensures we never discard a valid commission due to missing context.
         """
-        bucket = Config.DATA_BUCKET
+        if not self.enabled or not self.query_api: return []
         # Query last 2 days of executions
         # We need distinct ExecIds and their tags/timestamps
         query = f'''
-        from(bucket: "{bucket}")
+        from(bucket: "{self.bucket_data}")
           |> range(start: -2d)
           |> filter(fn: (r) => r["_measurement"] == "executions")
           |> filter(fn: (r) => r["_field"] == "FillPrice") 
@@ -741,13 +741,13 @@ class DatabaseClient:
         Retrieves the last known portfolio state from InfluxDB to prevent duplicate writes.
         Returns: Dict[(Account, Symbol) -> Quantity]
         """
-        bucket = Config.DATA_BUCKET
+        if not self.enabled or not self.query_api: return {}
         measurement = "positions_reconciled"
         
         # 1. Find the timestamp of the last batch write (look back 7 days)
         # We group by measurement to find the global max time across all series
         query_time = f'''
-        from(bucket: "{bucket}")
+        from(bucket: "{self.bucket_data}")
           |> range(start: -7d)
           |> filter(fn: (r) => r["_measurement"] == "{measurement}")
           |> group()
@@ -785,7 +785,7 @@ class DatabaseClient:
             t_stop_str = t_stop.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
             query_data = f'''
-            from(bucket: "{bucket}")
+            from(bucket: "{self.bucket_data}")
               |> range(start: {t_start_str}, stop: {t_stop_str})
               |> filter(fn: (r) => r["_measurement"] == "{measurement}")
               |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
@@ -826,7 +826,8 @@ class DatabaseClient:
         """
         Queries contract data from InfluxDB.
         """
-        # Filter logic
+        if not self.enabled or not self.query_api: 
+            return pd.DataFrame()
         f_string = ""
         if symbol:
              f_string = f'|> filter(fn: (r) => r["symbol"] == "{symbol}")'
@@ -835,7 +836,7 @@ class DatabaseClient:
              f_string = f'|> filter(fn: (r) => r["gConId"] == "{g_con_id}")'
              
         query = f'''
-        from(bucket: "{bucket}")
+        from(bucket: "{self.bucket_prices}")
           |> range(start: {start})
           {f_string}
           |> filter(fn: (r) => r["_measurement"] == "precios")
@@ -858,9 +859,10 @@ class DatabaseClient:
         Fetches the single most recent pricing record from the precios measurement.
         Returns a dict: {'BID': float, 'ASK': float, 'LAST': float}
         """
-        bucket = Config.INFLUXDB_BUCKET_PRICES
+        if not self.enabled or not self.query_api: 
+            return {"BID": 0.0, "ASK": 0.0, "LAST": 0.0}
         query = f'''
-        from(bucket: "{bucket}")
+        from(bucket: "{self.bucket_prices}")
           |> range(start: -30d)
           |> filter(fn: (r) => r["_measurement"] == "precios")
           |> filter(fn: (r) => r["symbol"] == "{symbol}")

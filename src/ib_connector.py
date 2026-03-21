@@ -210,7 +210,9 @@ class IBConnector:
         threading.Thread(target=self.reconcile_executions, daemon=True).start()
         
         # 1. Request Account Summary
-        tags = "NetLiquidation,TotalCashValue,AvailableFunds,BuyingPower,GrossPositionValue,UnrealizedPnL,RealizedPnL,DailyPnL,MaintMarginReq"
+        # Valid tags for reqAccountSummary: NetLiquidation, TotalCashValue, SettledCash, AvailableFunds, BuyingPower, GrossPositionValue, MaintMarginReq, etc.
+        # PnL tags are NOT supported here (they require reqPnL).
+        tags = "NetLiquidation,TotalCashValue,AvailableFunds,BuyingPower,GrossPositionValue,MaintMarginReq"
         self.account_summary_req_id = self.get_req_id()
         self.client.reqAccountSummary(self.account_summary_req_id, "All", tags)
         
