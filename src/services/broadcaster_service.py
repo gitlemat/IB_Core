@@ -13,7 +13,17 @@ class TickDataBroadcaster(IBBaseService):
         """
         Handles price ticks received from the Wrapper.
         """
-        if price <= 0: return
+        # Allow negative prices ONLY for spreads/BAGs.
+        # Check if the contract is a BAG before allowing <= 0 prices
+        g_con_id = self.connector.req_id_to_g_con_id.get(reqId)
+        is_bag = False
+        if g_con_id and g_con_id in self.connector.active_subscriptions:
+            contract = self.connector.active_subscriptions[g_con_id].get('contract')
+            if contract and contract.secType == 'BAG':
+                is_bag = True
+                
+        if price is None or (price <= 0 and not is_bag): 
+            return
         
         # Skip if this ID is flagged as NoPersist (e.g. BAG)
         if reqId in self.connector.non_persisted_req_ids:
@@ -23,7 +33,6 @@ class TickDataBroadcaster(IBBaseService):
         if tick_name == "UNKNOWN":
             return
             
-        g_con_id = self.connector.req_id_to_g_con_id.get(reqId)
         if g_con_id:
             symbol = self.connector.req_id_to_symbol.get(reqId, "Unknown")
             

@@ -17,36 +17,31 @@ class ContractResolutionService(IBBaseService):
             return contract._g_con_id
             
         if contract.secType == "BAG":
-            # For BAGs, we generate a canonical ID based on leg properties
-            leg_sigs = []
-            
-            # 1. Try comboLegs + Cache (IB sourced)
+            # 1. Try to get a readable name (best case)
+            readable_name = self.get_readable_contract_name(contract)
+            if readable_name and readable_name != "BAG:Unknown":
+                return readable_name
+                
+            # 2. Try to match by conIds if legs are already resolved (even if readable_name failed)
             if hasattr(contract, 'comboLegs') and contract.comboLegs:
-                unresolved = False
-                for leg in contract.comboLegs:
-                    details = self.connector.symbol_cache.get(leg.conId)
-                    if isinstance(details, dict):
-                        p = details.get('symbol')
-                        e = str(details.get('expiry', ""))[:6]
-                        leg_sigs.append(f"{p}-{e}-{leg.ratio}-{leg.action}")
-                    else:
-                        unresolved = True
-                        self.resolve_contract_by_conid(leg.conId)
-                if unresolved:
-                    return "UNRESOLVED_BAG"
-            
-            # 2. Try metadata legs (Watchlist sourced)
-            elif hasattr(contract, '_metadata_legs') and contract._metadata_legs:
-                for l in contract._metadata_legs:
-                    p = l.get('product') or l.get('symbol')
-                    e = str(l.get('expiry') or l.get('lastTradeDateOrContractMonth', ""))[:6]
-                    leg_sigs.append(f"{p}-{e}-{l.get('ratio')}-{l.get('action')}")
-            
-            if leg_sigs:
-                raw = "|".join(sorted(leg_sigs))
-                return generate_g_con_id("", "", "", "BAG", f"sigs:{raw}")
-            
-            return generate_g_con_id("", "", "", "BAG", contract.symbol)
+                # Use a stable conId-based signature if we can't get symbols yet
+                leg_ids = sorted([f"{l.conId}:{l.ratio}:{l.action}" for l in contract.comboLegs])
+                con_sig = "|".join(leg_ids)
+                
+                # Check if any active subscription has the same comboLegs signature
+                # This helps matching positions to watchlist-initiated subs
+                for gid, sub in self.connector.active_subscriptions.items():
+                    sub_c = sub.get('contract')
+                    if sub_c and sub_c.secType == "BAG" and sub_c.comboLegs:
+                        sub_sig = "|".join(sorted([f"{cl.conId}:{cl.ratio}:{cl.action}" for cl in sub_c.comboLegs]))
+                        if sub_sig == con_sig:
+                            return gid
+
+            # 3. Fallback to symbol string if provided
+            if contract.symbol and contract.symbol != "BAG":
+                return contract.symbol
+                
+            return generate_g_con_id("", "", "", "BAG", contract.symbol or "UnknownBAG")
         
         # For single legs, we need product, month, year
         from utils import parse_single_leg_details

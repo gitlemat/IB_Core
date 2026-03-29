@@ -170,7 +170,19 @@ class MarketDataService(IBBaseService):
                 
                 if all_resolved:
                     reg_contract.comboLegs = combo_legs
-                    self.logger.info(f"BAG {reg_contract.symbol} legs fully resolved and comboLegs populated.")
+                    self.logger.info(f"BAG {reg_contract.symbol} legs fully resolved and comboLegs populated. Triggering initial pricing and direct subscription.")
+                    
+                    # Trigger initial pricing calculation
+                    self._recalculate_bag_price(g_con_id, self.connector.active_subscriptions[g_con_id])
+                    
+                    # Request direct market data for the BAG Spread
+                    req_id = self.connector.active_subscriptions[g_con_id].get('req_id')
+                    if not req_id:
+                        req_id = self.connector.get_req_id()
+                        self.connector.active_subscriptions[g_con_id]['req_id'] = req_id
+                        self.connector.req_id_to_g_con_id[req_id] = g_con_id
+                    
+                    self.connector.client.reqMktData(req_id, reg_contract, "", False, False, [])
                 else:
                     self.logger.info(f"BAG {reg_contract.symbol} legs still not fully resolved.")
                     if contract_data not in self.pending_bags:
@@ -288,7 +300,8 @@ class MarketDataService(IBBaseService):
                 "conId": l_conid,
                 "symbol": l_display_sym,
                 "lastTradeDateOrContractMonth": l_exp,
-                "gConId": l.get("gConId") or l.get("g_con_id")
+                "gConId": l.get("gConId") or l.get("g_con_id"),
+                "multiplier": 1.0
             }
 
             if isinstance(details, dict):
@@ -300,6 +313,9 @@ class MarketDataService(IBBaseService):
                     res_leg["gConId"] = self.connector.contract_service.get_g_con_id(temp_c)
             elif not res_leg["symbol"] and l_conid:
                  res_leg["symbol"] = f"Unknown:{l_conid}"
+                 
+            if isinstance(details, dict):
+                 res_leg["multiplier"] = clean_float(details.get("multiplier", 1.0))
             
             leg_prices = self.connector.db_client.latest_prices.get(res_leg["gConId"], {})
             res_leg["bid"] = clean_float(leg_prices.get("BID"))
@@ -385,6 +401,23 @@ class MarketDataService(IBBaseService):
         
         if any(v is not None and v != 0 for v in clean_pricing.values()):
             self.connector.db_client.latest_prices[g_con_id] = clean_pricing
+            
+            # Broadcast Synthetic Update to WebSockets
+            if self.connector.ws_manager and self.connector.main_loop:
+                import asyncio
+                for tick_type, val in clean_pricing.items():
+                    if val is not None:
+                        msg = {
+                            "gConId": g_con_id,
+                            "symbol": self.connector.active_subscriptions.get(g_con_id, {}).get('symbol', 'Unknown'),
+                            "tickType": tick_type,
+                            "price": val,
+                            "timestamp": int(time.time() * 1000)
+                        }
+                        asyncio.run_coroutine_threadsafe(
+                            self.connector.ws_manager.broadcast(f"market:{g_con_id}", msg),
+                            self.connector.main_loop
+                        )
 
     def unsubscribe_contract(self, g_con_id: str):
         """

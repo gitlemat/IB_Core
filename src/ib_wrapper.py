@@ -207,7 +207,7 @@ class IBWrapper(EWrapper):
         """
         Receives contract details.
         """
-        self.logger.info(f"Contract Details Received. ReqId: {reqId}, Symbol: {contractDetails.contract.symbol}, ConId: {contractDetails.contract.conId}")
+        self.logger.info(f"Contract Details Received. ReqId: {reqId}, Symbol: {contractDetails.contract.symbol}, Multiplier: {contractDetails.contract.multiplier}, ConId: {contractDetails.contract.conId}")
         self.contract_details[reqId] = contractDetails
         
         # Populate Symbol Cache in App Context

@@ -81,9 +81,14 @@ class PortfolioService(IBBaseService):
                     self.logger.error(f"WS Broadcast error (account): {e}")
 
     def handle_position(self, account, contract, position, avgCost):
-        self.logger.info(f"Position Update | Account: {account} | Symbol: {contract.symbol} | Position: {position} | AvgCost: {avgCost}")
-        # 1. Update Portfolio Manager
-        self.portfolio_manager.on_position_update(account, contract, position, avgCost)
+        # 0. Normalize avgCost using Centralized Multiplier Logic (Backend-centric fix)
+        multiplier = self.connector.get_contract_multiplier(contract)
+        normalized_avg_cost = avgCost / multiplier if multiplier > 0 else avgCost
+        
+        self.logger.info(f"Position Update | Account: {account} | Symbol: {contract.symbol} | Position: {position} | RawAvgCost: {avgCost} | Mult: {multiplier} | NormalizedAvg: {normalized_avg_cost}")
+        
+        # 1. Update Portfolio Manager with Normalized Average Cost (Pass connector for gConId resolution)
+        self.portfolio_manager.on_position_update(account, contract, position, normalized_avg_cost, connector=self.connector)
         
         # 2. Dynamic Subscription: Ensure we are watching this contract
         if position != 0:
@@ -125,7 +130,7 @@ class PortfolioService(IBBaseService):
             for acc, positions in self.reconciled_positions.items():
                 if g_con_id in positions:
                     positions_list.append({
-                        "account": acc,
+                        "accountId": acc,
                         "qty": positions[g_con_id],
                         "avgPrice": self.reconciled_avg_costs.get(acc, {}).get(g_con_id, 0.0)
                     })
@@ -134,6 +139,42 @@ class PortfolioService(IBBaseService):
             tick = self.connector.db_client.get_latest_tick(g_con_id)
             last_price = tick.get('price', 0.0) if tick else 0.0
             
+            # Get multiplier with symbol_cache fallback
+            multiplier = getattr(contract, 'multiplier', 1)
+            if not multiplier or multiplier == "1" or multiplier == 1:
+                con_id = getattr(contract, 'conId', 0)
+                if con_id and con_id in self.connector.symbol_cache:
+                    multiplier = self.connector.symbol_cache[con_id].get('multiplier', multiplier)
+                else:
+                    lookup_sym = getattr(contract, 'localSymbol', '') or getattr(contract, 'symbol', '')
+                    for cid, c_data in self.connector.symbol_cache.items():
+                        if isinstance(c_data, dict):
+                            if c_data.get('localSymbol') == lookup_sym or c_data.get('symbol') == lookup_sym:
+                                multiplier = c_data.get('multiplier', multiplier)
+                                break
+                                
+            # If still 1 and it's a BAG, inherit the multiplier from its legs (for intra-commodity spreads)
+            if (not multiplier or multiplier == "1" or multiplier == 1) and contract.secType == "BAG":
+                bag_legs = data.get("legs", [])
+                if bag_legs:
+                    for leg in bag_legs:
+                        # Extract conId depending on whether it's a dict or a ComboLeg object
+                        leg_cid = leg.get('conId', 0) if isinstance(leg, dict) else getattr(leg, 'conId', 0)
+                        if not leg_cid and isinstance(leg, dict):
+                             # Try symbol lookup
+                             l_sym = leg.get('symbol')
+                             if l_sym:
+                                 for cid, c_data in self.connector.symbol_cache.items():
+                                     if isinstance(c_data, dict) and (c_data.get('symbol') == l_sym or c_data.get('localSymbol') == l_sym):
+                                         leg_cid = cid
+                                         break
+                        
+                        if leg_cid and leg_cid in self.connector.symbol_cache:
+                            leg_mult = self.connector.symbol_cache[leg_cid].get('multiplier')
+                            if leg_mult and leg_mult != "1" and leg_mult != 1:
+                                multiplier = leg_mult
+                                break
+
             payload = {
                 "gConId": g_con_id,
                 "symbol": self.connector.req_id_to_symbol.get(data['req_id'], contract.symbol),
@@ -141,6 +182,7 @@ class PortfolioService(IBBaseService):
                 "currency": contract.currency,
                 "exchange": contract.exchange,
                 "conId": contract.conId,
+                "multiplier": float(multiplier) if multiplier else 1.0,
                 "last": last_price,
                 "positions": positions_list
             }

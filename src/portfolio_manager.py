@@ -34,15 +34,19 @@ class PortfolioManager:
         self.last_portfolio_state: Dict[tuple, float] = {} # (Account, Symbol) -> Quantity
         self.initial_state_loaded = False
 
-    def on_position_update(self, account: str, contract: Any, position: float, avg_cost: float):
+    def on_position_update(self, account: str, contract: Any, position: float, avg_cost: float, connector=None):
         """
         Callback when a position update is received.
         """
+        g_con_id = None
         # 1. Prefer the stable ID attached to the contract object
         if hasattr(contract, '_g_con_id'):
             g_con_id = contract._g_con_id
+        elif connector:
+            # Use centralized service for matching IDs
+            g_con_id = connector.contract_service.get_g_con_id(contract)
         else:
-            # Fallback to generation if not already attached
+            # Fallback to legacy generation (single-legs only)
             details = parse_single_leg_details(contract.localSymbol or contract.symbol)
             g_con_id = generate_g_con_id(
                 details['product'], 

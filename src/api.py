@@ -437,12 +437,16 @@ async def list_unique_contracts(request: Request, accountId: Optional[str] = Que
         ask = pricing.get('ASK')
         last = pricing.get('LAST')
 
+        # A. Normalized Multiplier for PnL
+        multiplier = connector.get_contract_multiplier(contract, data)
+
         item = {
             "gConId": g_con_id,
             "symbol": readable_symbol,
             "secType": contract.secType,
             "currency": contract.currency,
-            "conId": 0 if contract.secType == "BAG" else (contract.conId if hasattr(contract, 'conId') else None),
+            "conId": 0 if contract.secType == "BAG" else (getattr(contract, 'conId', None)),
+            "multiplier": clean_float(multiplier or 1),
             "positions": positions_list,
             "bid": clean_float(bid),
             "ask": clean_float(ask),
@@ -523,6 +527,9 @@ async def get_contract_info(gConId: str, request: Request, accountId: Optional[s
         ask = pricing.get('ASK')
         last = pricing.get('LAST')
 
+        # Normalized Multiplier
+        multiplier = connector.get_contract_multiplier(contract, sub_data)
+
         # Convert object to dict
         c_dict = {
              "symbol": connector.get_readable_contract_name(contract),
@@ -532,6 +539,7 @@ async def get_contract_info(gConId: str, request: Request, accountId: Optional[s
              "strike": contract.strike,
              "right": contract.right,
              "conId": 0 if contract.secType == "BAG" else (contract.conId if hasattr(contract, 'conId') else None),
+             "multiplier": clean_float(multiplier or 1),
              "positions": positions_list,
              "bid": clean_float(bid),
              "ask": clean_float(ask),

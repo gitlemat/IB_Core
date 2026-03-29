@@ -130,6 +130,75 @@ class IBConnector:
         return req_id
 
 
+    def get_contract_multiplier(self, contract: Contract, metadata: Optional[Dict] = None) -> float:
+        """
+        Retrieves the multiplier for a contract, normalized to dollars per point.
+        For example, Lean Hogs (HE) reports 40000 in cent-units, which this normalizes to 400.
+        For BAGs, if the reported multiplier is 1, it attempts to inherit from its legs.
+        """
+        try:
+            # 1. Direct attribute
+            multiplier_str = getattr(contract, 'multiplier', "1")
+            multiplier = float(multiplier_str) if multiplier_str and multiplier_str not in ("0", "") else 1.0
+            
+            # 2. If it's 1 and we have a conId, check symbol_cache
+            if multiplier == 1.0:
+                con_id = getattr(contract, 'conId', 0)
+                if con_id and con_id in self.symbol_cache:
+                    multiplier = float(self.symbol_cache[con_id].get('multiplier', 1.0))
+                else:
+                    # 3. Fallback to symbol lookup in cache
+                    lookup_sym = getattr(contract, 'localSymbol', '') or getattr(contract, 'symbol', '')
+                    for cid, c_data in self.symbol_cache.items():
+                        if isinstance(c_data, dict):
+                            if c_data.get('localSymbol') == lookup_sym or c_data.get('symbol') == lookup_sym:
+                                multiplier = float(c_data.get('multiplier', 1.0))
+                                break
+
+            # 4. BAG Inheritance Logic
+            if multiplier == 1.0 and contract.secType == "BAG":
+                legs = []
+                if metadata and "legs" in metadata:
+                    legs = metadata["legs"]
+                elif hasattr(contract, 'comboLegs'):
+                    legs = contract.comboLegs
+                
+                self.logger.info(f"BAG Multiplier lookup for {contract.symbol}. Found {len(legs) if legs else 0} legs.")
+                
+                if legs:
+                    for leg in legs:
+                        # Extract conId depending on whether it's a dict or a ComboLeg object
+                        leg_cid = getattr(leg, 'conId', 0) if not isinstance(leg, dict) else leg.get('conId', 0)
+                        
+                        # Fallback to symbol lookup if conId is 0 or not in cache
+                        if (not leg_cid or leg_cid not in self.symbol_cache) and isinstance(leg, dict):
+                            l_sym = leg.get('symbol')
+                            if l_sym:
+                                for cid, c_data in self.symbol_cache.items():
+                                    if isinstance(c_data, dict) and (c_data.get('symbol') == l_sym or c_data.get('localSymbol') == l_sym):
+                                        leg_cid = cid
+                                        break
+
+                        if leg_cid and leg_cid in self.symbol_cache:
+                            leg_mult = float(self.symbol_cache[leg_cid].get('multiplier', 1.0))
+                            if leg_mult != 1.0:
+                                multiplier = leg_mult
+                                break
+
+            # 5. Normalization Heuristic (Cents -> Dollars)
+            # US Futures often report multiplier in cents (e.g. 40000 for HE, 5000 for ZC etc.)
+            # If it's > 1000, we likely need to divide by 100 to get points-to-dollars conversion.
+            # Exceptions include very large index multipliers (but even ES is 50, SPX is 100).
+            if multiplier >= 1000 and getattr(contract, 'currency', 'USD') == 'USD' and contract.secType in ('FUT', 'OPT', 'FOP', 'BAG'):
+                self.logger.debug(f"Normalizing large multiplier {multiplier} -> {multiplier/100.0} for {contract.symbol}")
+                multiplier /= 100.0
+            
+            return multiplier
+        except Exception as e:
+            self.logger.error(f"Error resolving multiplier for {getattr(contract, 'symbol', 'Unknown')}: {e}")
+            return 1.0
+
+
 
 
     def start(self):

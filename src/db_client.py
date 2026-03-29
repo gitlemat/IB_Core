@@ -925,22 +925,33 @@ class DatabaseClient:
             
             self.logger.info(f"BAG Calculation: Processing leg {leg.get('symbol')} (gConId: {l_gconid}) - Prices: {prices}")
             
-            # We treat 0.0 as potentially invalid for calculation to avoid skewed spreads
+            # Filter out non-positive prices for legs (error codes like -1 or -100)
             l_bid = prices.get('BID')
-            if (l_bid or 0.0) == 0.0: l_bid = None
+            if (l_bid or 0.0) <= 0.0: l_bid = None
             
             l_ask = prices.get('ASK')
-            if (l_ask or 0.0) == 0.0: l_ask = None
+            if (l_ask or 0.0) <= 0.0: l_ask = None
             
             l_last = prices.get('LAST')
-            if (l_last or 0.0) == 0.0: l_last = None
+            if (l_last or 0.0) <= 0.0: l_last = None
             
-            # Fail fast if ANY pricing data is missing for ANY leg
+            # --- Fallback: If no live prices, try to get the last known price from InfluxDB ---
             if l_bid is None and l_ask is None and l_last is None:
-                self.logger.info(f"BAG Calculation: Incomplete data for leg {leg.get('symbol')}. Aborting spread calculation.")
-                return {"bid": None, "ask": None, "last": None}
-            # Also fail if they are all 0.0 (initial state or invalid data)
-            if (l_bid or 0.0) == 0.0 and (l_ask or 0.0) == 0.0 and (l_last or 0.0) == 0.0:
+                leg_symbol = leg.get('symbol')
+                self.logger.debug(f"BAG Calculation: No live data for leg {leg_symbol}. Attempting DB fallback.")
+                
+                # Query by human-readable symbol if available (it's what GUI uses and it works)
+                db_record = self.get_last_price_record(leg_symbol or l_gconid)
+                if db_record:
+                    l_last = db_record.get('LAST')
+                    if (l_last or 0.0) <= 0.0: l_last = None
+                    # Use last as fallback for bid/ask too if needed for math
+                    l_bid = db_record.get('BID') or l_last
+                    l_ask = db_record.get('ASK') or l_last
+            
+            # Fail fast only if EVEN the DB fallback failed
+            if l_bid is None and l_ask is None and l_last is None:
+                self.logger.info(f"BAG Calculation: No data (live or DB) for leg {leg.get('symbol')}. Aborting spread calculation.")
                 return {"bid": None, "ask": None, "last": None}
                 
             if action == 'BUY':
