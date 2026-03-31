@@ -17,29 +17,41 @@ class ContractResolutionService(IBBaseService):
             return contract._g_con_id
             
         if contract.secType == "BAG":
-            # 1. Try to get a readable name (best case)
-            readable_name = self.get_readable_contract_name(contract)
-            if readable_name and readable_name != "BAG:Unknown":
-                return readable_name
-                
-            # 2. Try to match by conIds if legs are already resolved (even if readable_name failed)
+            # 1. Generate a stable conId-based signature for absolute identity
+            con_sig = None
             if hasattr(contract, 'comboLegs') and contract.comboLegs:
-                # Use a stable conId-based signature if we can't get symbols yet
                 leg_ids = sorted([f"{l.conId}:{l.ratio}:{l.action}" for l in contract.comboLegs])
                 con_sig = "|".join(leg_ids)
                 
-                # Check if any active subscription has the same comboLegs signature
-                # This helps matching positions to watchlist-initiated subs
+            # 2. Check Registry for an existing equivalent contract
+            # Identity is defined by the comboLegs signature
+            if con_sig:
                 for gid, sub in self.connector.active_subscriptions.items():
                     sub_c = sub.get('contract')
                     if sub_c and sub_c.secType == "BAG" and sub_c.comboLegs:
                         sub_sig = "|".join(sorted([f"{cl.conId}:{cl.ratio}:{cl.action}" for cl in sub_c.comboLegs]))
                         if sub_sig == con_sig:
+                            # Found an existing entry!
+                            # Let's see if we can improve its name now
+                            nice_name = self.get_readable_contract_name(contract)
+                            if nice_name and nice_name != "BAG:Unknown" and gid.startswith("BAG:"):
+                                # If existing entry is a placeholder and we have a real name, RENAME it
+                                self.connector._rename_subscription(gid, nice_name)
+                                return nice_name
                             return gid
 
-            # 3. Fallback to symbol string if provided
-            if contract.symbol and contract.symbol != "BAG":
+            # 3. If NOT in registry, try to get a nice name for the NEW entry
+            nice_name = self.get_readable_contract_name(contract)
+            if nice_name and nice_name != "BAG:Unknown":
+                return nice_name
+                
+            # 4. Fallback to symbol string ONLY if it's clearly a spread string (contains - or +)
+            if contract.symbol and contract.symbol != "BAG" and any(char in contract.symbol for char in "-+"):
                 return contract.symbol
+                
+            # 5. Final fallback: Use the signature as a placeholder ID
+            if con_sig:
+                return f"BAG:{con_sig}"
                 
             return generate_g_con_id("", "", "", "BAG", contract.symbol or "UnknownBAG")
         
@@ -88,8 +100,9 @@ class ContractResolutionService(IBBaseService):
         for leg in contract.comboLegs:
              cache_entry = self.connector.symbol_cache.get(leg.conId)
              if not cache_entry:
-                 if contract.symbol and contract.symbol != "BAG":
-                     return contract.symbol
+                  # If we are missing any leg resolution, stop and return empty.
+                  # This prevents falling back to a generic symbol like "HE".
+                  return ""
              
              leg_name = f"wid:{leg.conId}"
              if isinstance(cache_entry, dict):

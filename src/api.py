@@ -202,9 +202,35 @@ async def place_order(body: Dict[str, Any] = Body(...), request: Request = None)
     # Check if we need to infer secType? Default to FUT
     if 'secType' not in body:
         body['secType'] = 'FUT'
-        
-    order_id = body.get('orderId')
-    oid = connector.place_simple_order(body, body, order_id=order_id)
+    
+    # 1. Parse Contract
+    contract = create_contract(body)
+    
+    # NEW: Smart Resolution for Multileg Spreads (inferred BAG)
+    if contract.symbol and contract.secType == "FUT" and any(char in contract.symbol for char in ['+', '-']):
+        connector.logger.info(f"API: Detected potential spread in PlaceOrder: {contract.symbol}. Resolving legs...")
+        connector.resolve_bag_contract(contract)
+        if contract.secType == "BAG" and not contract.comboLegs:
+            raise HTTPException(status_code=400, detail=f"Failed to resolve legs for spread: {contract.symbol}")
+    
+    # 2. Extract specific parameters
+    action = body.get('action')
+    qty = float(body.get('qty', 0))
+    o_type = body.get('oType', 'LMT')
+    price = float(body.get('LmtPrice', body.get('price', 0)))
+    aux_price = float(body.get('auxPrice', 0))
+    tif = body.get('tif')
+    order_ref = body.get('orderRef', '')
+    account_id = body.get('accountId')
+    
+    if not all([action, qty]):
+        raise HTTPException(status_code=400, detail="Missing required order parameters (action, qty)")
+
+    oid = connector.place_simple_order(
+        contract, action, qty, o_type, 
+        price=price, lmtPrice=price, auxPrice=aux_price,
+        tif=tif, order_ref=order_ref, account_id=account_id
+    )
     return {"status": "Order Placed", "orderId": oid}
 
 @router.post("/Orders/PlaceOCA", summary="Crea una orden OCA")
@@ -230,9 +256,38 @@ async def place_bracket(body: Dict[str, Any] = Body(...), request: Request = Non
     if 'secType' not in body:
         body['secType'] = 'FUT'
         
+    # 1. Parse Contract
+    contract = create_contract(body)
+    
+    # NEW: Smart Resolution for Multileg Spreads (inferred BAG)
+    if contract.symbol and contract.secType == "FUT" and any(char in contract.symbol for char in ['+', '-']):
+        connector.logger.info(f"API: Detected potential spread in PlaceBracket: {contract.symbol}. Resolving legs...")
+        connector.resolve_bag_contract(contract)
+        if contract.secType == "BAG" and not contract.comboLegs:
+            raise HTTPException(status_code=400, detail=f"Failed to resolve legs for spread: {contract.symbol}")
+    
+    # 2. Extract positional arguments for connector.place_bracket_order
+    action = body.get('action')
+    qty = float(body.get('qty', 0))
+    price = float(body.get('LmtPrice', 0))
+    tp_price = float(body.get('LmtPriceTP', 0))
+    sl_price = float(body.get('LmtPriceSL', 0))
+    
+    # NEW: Extract metadata
+    tif = body.get('tif')
+    order_ref = body.get('orderRef', '')
+    account_id = body.get('accountId')
+    
+    if not all([action, qty]):
+        raise HTTPException(status_code=400, detail="Missing action or qty in bracket order request.")
+
     import traceback
     try:
-        order_ids = connector.place_bracket_order(None, body, body)
+        # Call with arguments as defined in ib_connector.py
+        order_ids = connector.place_bracket_order(
+            contract, action, qty, price, tp_price, sl_price,
+            tif=tif, order_ref=order_ref, account_id=account_id
+        )
         return {"status": "Bracket Placed", "orderIds": order_ids}
     except Exception as e:
         err_msg = traceback.format_exc()

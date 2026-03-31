@@ -18,7 +18,9 @@ class OrderAndReconciliationService(IBBaseService):
         self.order_status_cache: Dict[int, Dict] = {}
         self._last_forced_req_time = 0.0
         
-    def place_simple_order(self, contract: Contract, action: str, quantity: float, order_type: str, price: float = 0.0, lmtPrice: float = 0.0, auxPrice: float = 0.0) -> int:
+    def place_simple_order(self, contract: Contract, action: str, quantity: float, order_type: str, 
+                           price: float = 0.0, lmtPrice: float = 0.0, auxPrice: float = 0.0,
+                           tif: str = None, order_ref: str = "", account_id: str = None) -> int:
         """
         Places a simple order.
         """
@@ -29,13 +31,25 @@ class OrderAndReconciliationService(IBBaseService):
             quantity=quantity,
             order_type=order_type,
             lmt_price=lmtPrice if lmtPrice else price,
-            aux_price=auxPrice
+            aux_price=auxPrice,
+            tif=tif,
+            order_ref=order_ref
         )
+        
+        # Fallback to default managed account if None
+        if not account_id:
+            available_accounts = sorted(self.connector.wrapper.account_summary.keys())
+            if available_accounts:
+                account_id = available_accounts[0]
+        
+        if account_id:
+            o.account = account_id
+
         # Avoid GTC for BAGs, day orders usually safer for combos unless setup exactly right
         if contract.secType == "BAG":
             o.tif = "DAY"
             
-        self.logger.info(f"Placing Order {order_id} | {action} {quantity} {contract.symbol} @ {o.lmtPrice}")
+        self.logger.info(f"Placing Order {order_id} [{account_id}] | Ref: {order_ref} | {action} {quantity} {contract.symbol} @ {o.lmtPrice}")
         
         with self.connector.lock:
             self.connector.pending_order_confirmations[order_id] = time.time()
@@ -44,7 +58,8 @@ class OrderAndReconciliationService(IBBaseService):
         return order_id
 
     def place_bracket_order(self, contract: Contract, action: str, quantity: float, 
-                           entry_price: float, tp_price: float, sl_price: float) -> dict:
+                           entry_price: float, tp_price: float, sl_price: float,
+                           tif: str = None, order_ref: str = "", account_id: str = None) -> dict:
         """
         Places a full bracket order (Entry + TP + SL).
         """
@@ -52,27 +67,40 @@ class OrderAndReconciliationService(IBBaseService):
         tp_id = parent_id + 1
         sl_id = parent_id + 2
         
+        # Fallback to default managed account if None
+        if not account_id:
+            available_accounts = sorted(self.connector.wrapper.account_summary.keys())
+            if available_accounts:
+                account_id = available_accounts[0]
+
+        # Use GTC by default for brackets if not specified
+        if not tif:
+             tif = "GTC"
+
         # Parent limits
-        parent = create_order(action, quantity, "LMT", lmt_price=entry_price)
+        parent = create_order(action, quantity, "LMT", lmt_price=entry_price, tif=tif, order_ref=order_ref)
         parent.orderId = parent_id
         parent.transmit = False
+        if account_id: parent.account = account_id
         
         # Determine child actions
         child_action = "SELL" if action.upper() == "BUY" else "BUY"
         
         # Take Profit
-        tp = create_order(child_action, quantity, "LMT", lmt_price=tp_price)
+        tp = create_order(child_action, quantity, "LMT", lmt_price=tp_price, tif=tif, order_ref=order_ref)
         tp.orderId = tp_id
         tp.parentId = parent_id
         tp.transmit = False
+        if account_id: tp.account = account_id
         
         # Stop Loss
-        sl = create_order(child_action, quantity, "STP", aux_price=sl_price)
+        sl = create_order(child_action, quantity, "STP", aux_price=sl_price, tif=tif, order_ref=order_ref)
         sl.orderId = sl_id
         sl.parentId = parent_id
         sl.transmit = True # Transmit the whole bracket
+        if account_id: sl.account = account_id
         
-        self.logger.info(f"Placing Bracket [{parent_id}] | Entry: {entry_price}, TP: {tp_price}, SL: {sl_price}")
+        self.logger.info(f"Placing Bracket [{parent_id}] [{account_id}] | Ref: {order_ref} | Entry: {entry_price}, TP: {tp_price}, SL: {sl_price}")
         
         with self.connector.lock:
             self.connector.pending_order_confirmations[parent_id] = time.time()
@@ -84,9 +112,9 @@ class OrderAndReconciliationService(IBBaseService):
         self.connector.client.placeOrder(sl_id, contract, sl)
         
         return {
-            "entry_id": parent_id,
-            "tp_id": tp_id,
-            "sl_id": sl_id
+            "Parent": parent_id, # Consistent key names for strategy parsing
+            "TP": tp_id,
+            "SL": sl_id
         }
         
     def attach_bracket_to_execution(self, exec_id: str, action: str, quantity: float, tp_price: float, sl_price: float) -> dict:
@@ -202,6 +230,7 @@ class OrderAndReconciliationService(IBBaseService):
         
         oca_group = f"OCA_{order_id}"
         order_ref = oca_data.get('orderRef', '')
+        tif = oca_data.get('tif')
         
         # Stop Loss Order
         sl_id = order_id
@@ -210,7 +239,7 @@ class OrderAndReconciliationService(IBBaseService):
             quantity=float(oca_data.get('qty', 0)),
             order_type="STP",
             aux_price=float(oca_data.get('LmtPriceSL', 0)),
-            tif=oca_data.get('tif'),
+            tif=tif,
             order_ref=order_ref
         )
         sl_order.ocaGroup = oca_group
@@ -223,7 +252,7 @@ class OrderAndReconciliationService(IBBaseService):
             quantity=float(oca_data.get('qty', 0)),
             order_type="LMT",
             lmt_price=float(oca_data.get('LmtPrice', 0)),
-            tif=oca_data.get('tif'),
+            tif=tif,
             order_ref=order_ref
         )
         tp_order.ocaGroup = oca_group
@@ -287,6 +316,12 @@ class OrderAndReconciliationService(IBBaseService):
         """
         Handles execution reports.
         """
+        # 1. Immediate Deduplication Check by ID (Memory Cache populated from DB at startup)
+        if execution.execId in self.connector.execution_context:
+            # We already processed this execution in this session or found it in DB
+            self.logger.debug(f"Skipping execution {execution.execId} - already in cache/DB.")
+            return
+
         try:
             clean_time_str = execution.time.replace("  ", " ")
             exec_timestamp = datetime.strptime(clean_time_str, "%Y%m%d %H:%M:%S").replace(tzinfo=timezone.utc)
@@ -294,13 +329,18 @@ class OrderAndReconciliationService(IBBaseService):
             self.logger.warning(f"Could not parse execution time '{execution.time}', using now().")
             exec_timestamp = datetime.now(timezone.utc)
             
+        # 2. Secondary Deduplication Check by Timestamp (for very old data)
+        if self.connector.last_db_execution_time and exec_timestamp <= self.connector.last_db_execution_time:
+            self.logger.debug(f"Skipping execution {execution.execId} ({exec_timestamp}) as it is older than last known DB entry.")
+            return
+
         symbol_name = self.connector.get_readable_contract_name(contract)
 
         context = {
             'timestamp': exec_timestamp,
             'tags': {
                 'Symbol': symbol_name,
-                'AccountId': execution.accountId,
+                'AccountId': execution.acctNumber,
                 'PermId': execution.permId,
                 'ExecId': execution.execId,
                 'Strategy': execution.orderRef
@@ -309,10 +349,6 @@ class OrderAndReconciliationService(IBBaseService):
 
         with self.connector.lock:
             self.connector.execution_context[execution.execId] = context
-
-        if self.connector.last_db_execution_time and exec_timestamp <= self.connector.last_db_execution_time:
-            self.logger.debug(f"Skipping execution {execution.execId} ({exec_timestamp}) as it is older than last DB entry")
-            return
 
         exec_data = {
             "execId": execution.execId,
@@ -324,7 +360,7 @@ class OrderAndReconciliationService(IBBaseService):
             "permId": execution.permId,
             "secType": contract.secType,
             "avgPrice": execution.avgPrice,
-            "accountId": execution.accountId,
+            "accountId": execution.acctNumber,
             "strategy": execution.orderRef 
         }
         self.connector.db_client.write_execution(exec_data, Config.is_paper_trading(), timestamp=exec_timestamp)
@@ -361,7 +397,9 @@ class OrderAndReconciliationService(IBBaseService):
         self.connector.pending_order_confirmations.pop(orderId, None)
         
         # Dynamic Subscription: Ensure we are watching this contract
-        self.connector.subscribe_contract(contract)
+        # Optimization: Only subscribe if not already in registry or if we suspect it needs a refresh
+        if g_con_id not in self.connector.active_subscriptions:
+            self.connector.subscribe_contract(contract)
         
         # Trigger change detection and write to InfluxDB
         has_changed, delta = self.check_and_write_order_status(orderId)

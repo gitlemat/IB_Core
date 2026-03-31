@@ -435,6 +435,7 @@ class DatabaseClient:
             point.time(now)
             
             if self.write_api:
+                bucket = Config.DATA_BUCKET
                 self.write_api.write(bucket=bucket, record=point)
                 self.logger.info(f"Written partial order update for Order {order_data.get('orderId')}. Fields: {list(order_data.keys())}")
         except Exception as e:
@@ -460,6 +461,12 @@ class DatabaseClient:
       |> filter(fn: (r) => r["_measurement"] == "{measurement}")
       |> filter(fn: (r) => contains(value: r["orderId"], set: [{id_filter}]))
       |> last()
+      |> map(fn: (r) => ({{ r with 
+          accountId: if exists r.accountId then r.accountId else "",
+          symbol: if exists r.symbol then r.symbol else "",
+          orderId: if exists r.orderId then r.orderId else "",
+          permId: if exists r.permId then r.permId else ""
+      }}))
       |> rename(columns: {{"accountId": "tag_accountId", "symbol": "tag_symbol", "orderId": "tag_orderId", "permId": "tag_permId"}})
       |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
     '''
@@ -526,6 +533,7 @@ class DatabaseClient:
         # Let's write immediately for account info to be fresh.
         try:
             if self.write_api:
+                bucket = Config.DATA_BUCKET
                 self.write_api.write(bucket=bucket, record=point)
                 self.logger.debug(f"Written account summary to {bucket}")
         except Exception as e:
@@ -642,6 +650,7 @@ class DatabaseClient:
 
         try:
             if self.write_api:
+                bucket = Config.DATA_BUCKET
                 self.write_api.write(bucket=bucket, record=point)
                 self.logger.info(f"Written execution to {bucket} with ts {ts}")
         except Exception as e:
@@ -676,6 +685,7 @@ class DatabaseClient:
 
         try:
             if self.write_api:
+                bucket = Config.DATA_BUCKET
                 self.write_api.write(bucket=bucket, record=point)
                 self.logger.info(f"Written commission update to {bucket} with MERGED ts {timestamp}")
         except Exception as e:
@@ -706,12 +716,12 @@ class DatabaseClient:
         """
         Retrieves ALL recent executions (last 48h) to populate the memory cache.
         """
-        if not self.enabled or not self.query_api: return []
-        # Query last 2 days of executions
+        if (not self.enabled or not self.query_api): return []
+        # Query last 7 days of executions
         # We need distinct ExecIds and their tags/timestamps
         query = f'''
         from(bucket: "{self.bucket_data}")
-          |> range(start: -2d)
+          |> range(start: -7d)
           |> filter(fn: (r) => r["_measurement"] == "executions")
           |> filter(fn: (r) => r["_field"] == "FillPrice") 
           |> unique(column: "ExecId")
@@ -923,7 +933,7 @@ class DatabaseClient:
             ratio = float(leg.get('ratio', 1))
             action = leg.get('action', 'BUY')
             
-            self.logger.info(f"BAG Calculation: Processing leg {leg.get('symbol')} (gConId: {l_gconid}) - Prices: {prices}")
+            self.logger.debug(f"BAG Calculation: Processing leg {leg.get('symbol')} (gConId: {l_gconid}) - Prices: {prices}")
             
             # Filter out non-positive prices for legs (error codes like -1 or -100)
             l_bid = prices.get('BID')
@@ -983,5 +993,5 @@ class DatabaseClient:
             "ask": spread_ask,
             "last": spread_last
         }
-        self.logger.info(f"BAG Calculation: Success! Calculated Spread: {res}")
+        self.logger.debug(f"BAG Calculation: Success! Calculated Spread: {res}")
         return res

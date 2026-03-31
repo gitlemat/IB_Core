@@ -1,5 +1,5 @@
-import logging
 from typing import TYPE_CHECKING
+from logger import LoggerSetup
 
 if TYPE_CHECKING:
     from main_facade import IBConnector  # Will be the refactored IBConnector
@@ -11,5 +11,5 @@ class IBBaseService:
     """
     def __init__(self, connector: 'IBConnector'):
         self.connector = connector
-        # Use child class name for logger
-        self.logger = logging.getLogger(self.__class__.__name__)
+        # Use child class name for logger via our common utility
+        self.logger = LoggerSetup.get_logger(self.__class__.__name__)

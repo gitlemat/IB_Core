@@ -211,6 +211,18 @@ class IBConnector:
         # Start DB Flush Monitor
         self.db_client.start_monitor()
 
+        # Load Execution Context from DB (Deduplication)
+        try:
+            self.logger.info("Loading recent execution context from DB for deduplication...")
+            recent_contexts = self.db_client.get_recent_executions_context()
+            for ctx in recent_contexts:
+                self.execution_context[ctx['execId']] = ctx
+            
+            self.last_db_execution_time = self.db_client.get_last_execution_time()
+            self.logger.info(f"Loaded {len(recent_contexts)} executions. Cutoff: {self.last_db_execution_time}")
+        except Exception as e:
+            self.logger.error(f"Failed to load recent execution context: {e}")
+
         # Start Tick Flush Loop (Throttling) 
         self.flush_thread = threading.Thread(target=self.broadcaster_service.flush_ticks_loop, daemon=True)
         self.flush_thread.start()
@@ -255,6 +267,76 @@ class IBConnector:
 
     def _find_g_con_id_by_con_id(self, con_id: int) -> Optional[str]:
         return self.market_data_service._find_g_con_id_by_con_id(con_id)
+
+    def _rename_subscription(self, old_gid: str, new_gid: str):
+        """
+        Safely renames an active subscription from an old gConId to a new one.
+        Updates all internal registries and caches to maintain continuity.
+        """
+        if old_gid == new_gid:
+            return
+            
+        with self.lock:
+            if old_gid not in self.active_subscriptions:
+                return
+                
+            self.logger.info(f"Renaming subscription: {old_gid} -> {new_gid}")
+            
+            # 1. Update Active Subscriptions Registry
+            data = self.active_subscriptions.pop(old_gid)
+            self.active_subscriptions[new_gid] = data
+            
+            # 2. Update ReqId Mappings
+            for rid, gid in list(self.req_id_to_g_con_id.items()):
+                if gid == old_gid:
+                    self.req_id_to_g_con_id[rid] = new_gid
+            
+            # 3. Update Order Mappings
+            for oid, gid in list(self.order_id_to_g_con_id.items()):
+                if gid == old_gid:
+                    self.order_id_to_g_con_id[oid] = new_gid
+            
+            # 4. Update Database Client Caches
+            if old_gid in self.db_client.latest_prices:
+                self.db_client.latest_prices[new_gid] = self.db_client.latest_prices.pop(old_gid)
+            if old_gid in self.db_client.latest_sizes:
+                self.db_client.latest_sizes[new_gid] = self.db_client.latest_sizes.pop(old_gid)
+            if hasattr(self.db_client, 'last_queued_prices') and old_gid in self.db_client.last_queued_prices:
+                self.db_client.last_queued_prices[new_gid] = self.db_client.last_queued_prices.pop(old_gid)
+            
+            # 5. Update MarketDataService Caches (Last Calc States)
+            if hasattr(self.market_data_service, '_last_bag_leg_states') and old_gid in self.market_data_service._last_bag_leg_states:
+                self.market_data_service._last_bag_leg_states[new_gid] = self.market_data_service._last_bag_leg_states.pop(old_gid)
+            
+            # 6. Update PortfolioManager Registry (Identity Migration)
+            pm = self.portfolio_service.portfolio_manager
+            # A. Raw Positions
+            for acc in pm.raw_positions:
+                if old_gid in pm.raw_positions[acc]:
+                    pm.raw_positions[acc][new_gid] = pm.raw_positions[acc].pop(old_gid)
+            
+            # B. Raw Avg Costs
+            for acc in pm.raw_avg_costs:
+                if old_gid in pm.raw_avg_costs[acc]:
+                    pm.raw_avg_costs[acc][new_gid] = pm.raw_avg_costs[acc].pop(old_gid)
+            
+            # C. Reconciled Positions
+            for acc in pm.reconciled_positions:
+                if old_gid in pm.reconciled_positions[acc]:
+                    pm.reconciled_positions[acc][new_gid] = pm.reconciled_positions[acc].pop(old_gid)
+            
+            # D. Reconciled Avg Costs
+            for acc in pm.reconciled_avg_costs:
+                if old_gid in pm.reconciled_avg_costs[acc]:
+                    pm.reconciled_avg_costs[acc][new_gid] = pm.reconciled_avg_costs[acc].pop(old_gid)
+            
+            # E. Raw Contracts Cache
+            if old_gid in pm.raw_contracts:
+                pm.raw_contracts[new_gid] = pm.raw_contracts.pop(old_gid)
+
+            # 7. Update Contract Metadata
+            if data.get('contract'):
+                data['contract']._g_con_id = new_gid
 
     def _is_leg_used_by_active_bags(self, leg_con_id: int) -> bool:
         return self.market_data_service._is_leg_used_by_active_bags(leg_con_id)
@@ -388,8 +470,10 @@ class IBConnector:
 
     # --- Order Management ---
 
-    def place_simple_order(self, contract: Contract, action: str, quantity: float, order_type: str, price: float = 0.0, lmtPrice: float = 0.0, auxPrice: float = 0.0) -> int:
-        return self.order_service.place_simple_order(contract, action, quantity, order_type, price, lmtPrice, auxPrice)
+    def place_simple_order(self, contract: Contract, action: str, quantity: float, order_type: str, 
+                           price: float = 0.0, lmtPrice: float = 0.0, auxPrice: float = 0.0,
+                           tif: str = None, order_ref: str = "", account_id: str = None) -> int:
+        return self.order_service.place_simple_order(contract, action, quantity, order_type, price, lmtPrice, auxPrice, tif, order_ref, account_id)
 
     def request_open_orders_sync(self):
         """
@@ -408,8 +492,10 @@ class IBConnector:
     def place_oca_order(self, order_id: Optional[int], contract_data: dict, oca_data: dict) -> dict:
         return self.order_service.place_oca_order(order_id, contract_data, oca_data)
 
-    def place_bracket_order(self, contract: Contract, action: str, quantity: float, entry_price: float, tp_price: float, sl_price: float) -> dict:
-        return self.order_service.place_bracket_order(contract, action, quantity, entry_price, tp_price, sl_price)
+    def place_bracket_order(self, contract: Contract, action: str, quantity: float, 
+                           entry_price: float, tp_price: float, sl_price: float,
+                           tif: str = None, order_ref: str = "", account_id: str = None) -> dict:
+        return self.order_service.place_bracket_order(contract, action, quantity, entry_price, tp_price, sl_price, tif, order_ref, account_id)
         
     def attach_bracket_to_execution(self, exec_id: str, action: str, quantity: float, tp_price: float, sl_price: float) -> dict:
         return self.order_service.attach_bracket_to_execution(exec_id, action, quantity, tp_price, sl_price)

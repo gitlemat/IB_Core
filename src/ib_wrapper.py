@@ -93,6 +93,8 @@ class IBWrapper(EWrapper):
         """
         Market data price tick.
         """
+
+        self.logger.debug(f"[RECEIVE] tickPrice. ReqId: {reqId}, Type: {tickType}, Price: {price}")
         if self.app_context:
             self.app_context.handle_tick_price(reqId, tickType, price)
 
@@ -207,7 +209,7 @@ class IBWrapper(EWrapper):
         """
         Receives contract details.
         """
-        self.logger.info(f"Contract Details Received. ReqId: {reqId}, Symbol: {contractDetails.contract.symbol}, Multiplier: {contractDetails.contract.multiplier}, ConId: {contractDetails.contract.conId}")
+        self.logger.info(f"Contract Details Received. ReqId: {reqId}, Symbol: {contractDetails.contract.symbol}, LocalSymbol: {contractDetails.contract.localSymbol}, Multiplier: {contractDetails.contract.multiplier}, ConId: {contractDetails.contract.conId}")
         self.contract_details[reqId] = contractDetails
         
         # Populate Symbol Cache in App Context
@@ -243,7 +245,7 @@ class IBWrapper(EWrapper):
         """
         Callback for position updates.
         """
-        self.logger.info(f"[RECEIVE] position. Account: {account}, Symbol: {contract.symbol}, Pos: {position}, AvgCost: {avgCost}")
+        self.logger.info(f"[RECEIVE] position. Account: {account}, Symbol: {contract.symbol}, LocalSymbol: {contract.localSymbol}, Pos: {position}, AvgCost: {avgCost}")
         if self.app_context:
             self.app_context.handle_position(account, contract, position, avgCost)
 

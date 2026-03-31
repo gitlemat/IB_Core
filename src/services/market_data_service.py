@@ -11,9 +11,10 @@ from utils import (
 class MarketDataService(IBBaseService):
     def __init__(self, connector: 'IBConnector'):
         super().__init__(connector)
-        # Tick Buffer for Throttling (if we wanted to move it here, 
-        # but broadcaster uses it too. For now let's focus on logic)
+        # Tick Buffer for Throttling
         self.pending_bags: List[Dict] = []
+        # Cache for BAG Calculation Throttling: gConId -> {Leg_gConId: {BID: ..., ASK: ..., LAST: ...}}
+        self._last_bag_leg_states: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     def subscribe_contract_by_conid(self, con_id: int):
         """
@@ -65,6 +66,10 @@ class MarketDataService(IBBaseService):
                 if not contract.localSymbol:
                      contract.localSymbol = contract.symbol
                 contract.symbol = product
+
+            # Ensure exchange is set for single-leg subscriptions
+            if not contract.exchange:
+                contract.exchange = get_exchange_for_product(product or contract.symbol)
         else:
             contract = contract_data
             legs = None
@@ -81,6 +86,10 @@ class MarketDataService(IBBaseService):
                     if not contract.localSymbol:
                          contract.localSymbol = contract.symbol
                     contract.symbol = product
+                
+                # Ensure exchange is set for single-leg subscriptions
+                if not contract.exchange:
+                    contract.exchange = get_exchange_for_product(product or contract.symbol)
             else:
                  product = month = year = ""
 
@@ -90,19 +99,25 @@ class MarketDataService(IBBaseService):
                 existing_sub = self.connector.active_subscriptions[g_con_id]
                 if not existing_sub.get('contract'):
                     existing_sub['contract'] = contract
-                else:
-                    self.logger.debug(f"Contract {contract.symbol} (ID: {g_con_id}) already in registry.")
-                    if contract.secType != "BAG":
+                
+                # Merge legs metadata if provided and currently missing or incomplete
+                if contract.secType == "BAG" and legs:
+                    if not existing_sub.get('legs'):
+                        existing_sub['legs'] = legs
+                        self.logger.info(f"Updated legs metadata for EXISTING BAG {g_con_id}")
+                    elif len(existing_sub.get('legs', [])) < len(legs):
+                         # If new leg list is more complete, upgrade it
+                         existing_sub['legs'] = legs
+                         self.logger.info(f"Upgraded legs metadata for EXISTING BAG {g_con_id}")
+                
+                if contract.secType != "BAG" and g_con_id not in self.connector.db_client.latest_prices:
+                    symbol_name = self.connector.contract_service.get_readable_contract_name(contract)
+                    last_record = self.connector.db_client.get_last_price_record(symbol_name)
+                    if any(v > 0 for v in last_record.values()):
+                        self.connector.db_client.latest_prices[g_con_id] = last_record
+                        self.logger.info(f"Syncing pricing for EXISTING contract {symbol_name} from DB: {last_record}")
                         self.update_dependent_bags(g_con_id)
-                    
-                    if contract.secType != "BAG" and g_con_id not in self.connector.db_client.latest_prices:
-                        symbol_name = self.connector.contract_service.get_readable_contract_name(contract)
-                        last_record = self.connector.db_client.get_last_price_record(symbol_name)
-                        if any(v > 0 for v in last_record.values()):
-                            self.connector.db_client.latest_prices[g_con_id] = last_record
-                            self.logger.info(f"Syncing pricing for EXISTING contract {symbol_name} from DB: {last_record}")
-                            self.update_dependent_bags(g_con_id)
-                    return
+                return
 
         # If it's a BAG, we register it but DO NOT subscribe to it directly
         if contract.secType == 'BAG':
@@ -170,7 +185,7 @@ class MarketDataService(IBBaseService):
                 
                 if all_resolved:
                     reg_contract.comboLegs = combo_legs
-                    self.logger.info(f"BAG {reg_contract.symbol} legs fully resolved and comboLegs populated. Triggering initial pricing and direct subscription.")
+                    self.logger.info(f"Subscribing to reqMktData for BAG {reg_contract.symbol} legs fully resolved and comboLegs populated. Triggering initial pricing and direct subscription.")
                     
                     # Trigger initial pricing calculation
                     self._recalculate_bag_price(g_con_id, self.connector.active_subscriptions[g_con_id])
@@ -218,7 +233,7 @@ class MarketDataService(IBBaseService):
         with self.connector.lock:
             self.connector.req_id_to_symbol[req_id] = contract.localSymbol if contract.localSymbol else contract.symbol
              
-        self.logger.info(f"Subscribing to {self.connector.req_id_to_symbol.get(req_id, 'Unknown')} (ReqId: {req_id}, gConId: {g_con_id})...")
+        self.logger.info(f"Subscribing to reqMktData {self.connector.req_id_to_symbol.get(req_id, 'Unknown')} (ReqId: {req_id}, gConId: {g_con_id})...")
         self.connector.client.reqMktData(req_id, contract, "", False, False, [])
 
     def check_pending_bags(self):
@@ -392,6 +407,22 @@ class MarketDataService(IBBaseService):
         
         if not isinstance(legs, list) or not legs: return
         
+        # --- Optimization: Throttled Recalculation ---
+        # Compare current leg prices with the last state used for THIS Bag
+        current_leg_states = {}
+        for l in legs:
+            l_gid = l.get('g_con_id') or l.get('gConId')
+            if l_gid:
+                # Store a snapshot of current leg prices
+                current_leg_states[l_gid] = self.connector.db_client.latest_prices.get(l_gid, {}).copy()
+        
+        if self._last_bag_leg_states.get(g_con_id) == current_leg_states and current_leg_states:
+            # self.logger.debug(f"Skipping redundant calculation for BAG {g_con_id}. Leg prices unchanged.")
+            return
+
+        self._last_bag_leg_states[g_con_id] = current_leg_states
+        # --- End Optimization ---
+
         pricing = self.connector.db_client.get_realtime_synthetic_price(legs)
         clean_pricing = {
             "BID": pricing.get('bid'),

@@ -109,6 +109,19 @@ class PortfolioManager:
                 for leg in legs:
                     # Prefer existing ID in meta if available
                     leg_g_con_id = leg.get('g_con_id') or leg.get('gConId')
+                    
+                    # If not in meta, try to resolve via central registry (stable lookup)
+                    if not leg_g_con_id and active_subscriptions:
+                        leg_con_id = leg.get('conId')
+                        if leg_con_id:
+                            # Search in registry for an active sub with this conId
+                            for gid, sub in active_subscriptions.items():
+                                sub_c = sub.get('contract')
+                                if sub_c and getattr(sub_c, 'conId', 0) == leg_con_id:
+                                    leg_g_con_id = gid
+                                    break
+                    
+                    # Fallback to manual generation only if absolutely needed
                     if not leg_g_con_id:
                         leg_g_con_id = generate_g_con_id(
                             leg.get('product', ''),
