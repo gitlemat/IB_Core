@@ -125,16 +125,6 @@ def log_ib_object(logger, prefix: str, obj):
     full_msg = f"{prefix}: {obj.__class__.__name__} | " + " | ".join(attrs)
     logger.info(full_msg)
 
-def get_exchange_for_product(product: str) -> str:
-    """
-    Returns the default exchange for a given product symbol.
-    - NG -> NYMEX
-    - Others -> CME (default)
-    """
-    if product.upper() == "NG":
-        return "NYMEX"
-    return "CME"
-
 def create_contract(data: Dict[str, Any]) -> Contract:
     """
     Creates an IB Contract object from a dictionary.
@@ -146,11 +136,7 @@ def create_contract(data: Dict[str, Any]) -> Contract:
     contract.symbol = s(data.get('symbol', ''))
     contract.secType = s(data.get('secType', 'FUT'))
     
-    # Use product-based exchange default if not provided
-    exchange = data.get('exchange')
-    if not exchange:
-        exchange = get_exchange_for_product(contract.symbol)
-    contract.exchange = s(exchange)
+    contract.exchange = s(data.get('exchange', ''))
     
     contract.currency = s(data.get('currency', 'USD'))
     # Support both key names for expiry
@@ -317,7 +303,7 @@ def parse_contract_symbol(symbol_str: str) -> List[Dict[str, Any]]:
             "ratio": ratio,
             "action": action,
             "secType": "FUT",
-            "exchange": get_exchange_for_product(product),
+            "exchange": "",
             "currency": "USD"
         })
         
@@ -346,3 +332,36 @@ def get_bracket_reference() -> str:
     import time
     import random
     return f"BRK_{int(time.time())}_{random.randint(100, 999)}"
+
+def calculate_display_price(ticks: Dict[str, Any]) -> Optional[float]:
+    """
+    Calculates a single display price from a ticks dictionary.
+    Priority: LAST > mid(BID, ASK) > BID > ASK
+    """
+    if not ticks:
+        return None
+        
+    # Get values, handling both upper and lower case keys
+    last = ticks.get('LAST') or ticks.get('last')
+    bid = ticks.get('BID') or ticks.get('bid')
+    ask = ticks.get('ASK') or ticks.get('ask')
+    
+    # Sanitize inputs
+    last = clean_float(last)
+    bid = clean_float(bid)
+    ask = clean_float(ask)
+    
+    if last and last > 0:
+        return last
+        
+    if bid and ask and bid > 0 and ask > 0:
+        return (bid + ask) / 2
+        
+    if bid and bid > 0:
+        return bid
+        
+    if ask and ask > 0:
+        return ask
+        
+    return None
+

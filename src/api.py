@@ -4,7 +4,11 @@ from typing import List, Dict, Any, Optional
 from models import IBContract
 from ib_connector import IBConnector
 from config import Config
-from utils import parse_contract_symbol, create_contract, clean_float
+from utils import (
+    create_contract, clean_float, 
+    parse_single_leg_details, parse_contract_symbol,
+    calculate_display_price
+)
 from connection_manager import ConnectionManager
 import pandas as pd
 import json
@@ -487,10 +491,10 @@ async def list_unique_contracts(request: Request, accountId: Optional[str] = Que
         readable_symbol = connector.get_readable_contract_name(contract)
         
         # Pricing (Unified Cache)
-        pricing = connector.db_client.latest_prices.get(g_con_id, {})
-        bid = pricing.get('BID')
-        ask = pricing.get('ASK')
-        last = pricing.get('LAST')
+        prices = connector.db_client.latest_prices.get(g_con_id, {})
+        bid = prices.get('BID')
+        ask = prices.get('ASK')
+        last = calculate_display_price(prices) or 0.0
 
         # A. Normalized Multiplier for PnL
         multiplier = connector.get_contract_multiplier(contract, data)

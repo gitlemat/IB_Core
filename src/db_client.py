@@ -993,5 +993,11 @@ class DatabaseClient:
             "ask": spread_ask,
             "last": spread_last
         }
+        
+        # Fallback for last if missing
+        if (not res.get('last') or res['last'] == 0) and res.get('bid') is not None and res.get('ask') is not None:
+             res['last'] = (res['bid'] + res['ask']) / 2
+
         self.logger.debug(f"BAG Calculation: Success! Calculated Spread: {res}")
         return res
+

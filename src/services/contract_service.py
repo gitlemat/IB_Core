@@ -2,12 +2,42 @@ from typing import Dict, Any, List, Optional
 import threading
 from ibapi.contract import Contract, ComboLeg
 from .base_service import IBBaseService
-from utils import parse_contract_symbol, get_exchange_for_product, get_short_symbol, generate_g_con_id
+from utils import parse_contract_symbol, get_short_symbol, generate_g_con_id
 
 class ContractResolutionService(IBBaseService):
     def __init__(self, connector: 'IBConnector'):
         super().__init__(connector)
+        # Cache for Product Symbol -> Valid Exchange (e.g., 'HE' -> 'CME')
+        # This allows instant resolution for all contracts of the same product.
+        self.product_exchange_cache: Dict[str, str] = {}
         
+    def resolve_product_exchange(self, contract: Contract) -> Optional[str]:
+        """
+        Attempts to resolve the exchange for a contract using local caches.
+        Returns the exchange string if found, otherwise None.
+        """
+        from utils import parse_single_leg_details
+        
+        # 1. Check if already present in contract
+        if contract.exchange:
+            return contract.exchange
+            
+        # 2. Check per-instrument cache (if conId exists)
+        if contract.conId and contract.conId in self.connector.symbol_cache:
+            details = self.connector.symbol_cache[contract.conId]
+            if isinstance(details, dict) and details.get('exchange'):
+                return details['exchange']
+                
+        # 3. Check product-level cache
+        sym_to_parse = contract.localSymbol if contract.localSymbol else contract.symbol
+        details = parse_single_leg_details(sym_to_parse)
+        product = details.get('product')
+        
+        if product and product in self.product_exchange_cache:
+            return self.product_exchange_cache[product]
+            
+        return None
+
     def get_g_con_id(self, contract: Contract) -> str:
         """
         Helper to generate a consistent gConId for any contract.
@@ -156,12 +186,21 @@ class ContractResolutionService(IBBaseService):
         for sym_str in symbols:
             legs_parsed = parse_contract_symbol(sym_str)
             for leg in legs_parsed:
+                # Try to resolve exchange from cache
+                exc = leg.get('exchange')
+                if not exc:
+                    # Create a temporary contract to check the cache
+                    temp_c = Contract()
+                    temp_c.symbol = leg['symbol']
+                    temp_c.secType = leg.get('secType', 'FUT')
+                    exc = self.resolve_product_exchange(temp_c) or ""
+                
                 unique_legs.add((
                     leg.get('product', ''),
                     leg.get('expiry', ''),
                     leg['symbol'],
                     leg.get('secType', 'FUT'),
-                    leg.get('exchange', get_exchange_for_product(leg['symbol'])),
+                    exc,
                     leg.get('currency', 'USD')
                 ))
                     
@@ -237,7 +276,7 @@ class ContractResolutionService(IBBaseService):
                     lc.symbol = l_name 
                 
                 lc.secType = l.get('secType', 'FUT')
-                lc.exchange = l.get('exchange', get_exchange_for_product(lc.symbol))
+                lc.exchange = l.get('exchange', self.resolve_product_exchange(lc) or "")
                 lc.currency = l.get('currency', 'USD')
                 
                 req_id = self.connector.get_req_id()
@@ -263,7 +302,12 @@ class ContractResolutionService(IBBaseService):
                 clem.conId = l_conid
                 clem.ratio = l.get('ratio', 1)
                 clem.action = l.get('action', 'BUY')
-                clem.exchange = l.get('exchange', get_exchange_for_product(l_name))
+                
+                # Check cache for leg exchange
+                temp_lc = Contract()
+                temp_lc.conId = l_conid
+                temp_lc.symbol = l_name
+                clem.exchange = l.get('exchange', self.resolve_product_exchange(temp_lc) or "")
                 combo_legs.append(clem)
             else:
                 self.logger.warning(f"Could not resolve conId for leg: {l_name} {l_expiry}")
@@ -277,7 +321,8 @@ class ContractResolutionService(IBBaseService):
             if legs_parsed:
                 contract.symbol = legs_parsed[0].get("product")
             
-            contract.exchange = get_exchange_for_product(contract.symbol) if contract.symbol else "CME"
+            # Resolve BAG exchange
+            contract.exchange = self.resolve_product_exchange(contract) or "SMART"
             self.logger.info(f"Successfully resolved BAG: {contract.symbol} with {len(combo_legs)} legs.")
         else:
             self.logger.error(f"Failed to fully resolve BAG legs for {contract.symbol}. Order might fail if IB cannot resolve it.")

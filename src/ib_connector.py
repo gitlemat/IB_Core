@@ -25,7 +25,7 @@ from db_client import DatabaseClient
 from utils import (
     generate_g_con_id, map_tick_type, create_contract, create_order, 
     generate_spread_symbol_str, parse_contract_symbol, get_short_symbol,
-    get_exchange_for_product, log_ib_object, clean_float
+    log_ib_object, clean_float
 )
 from models import IBContract, AccountSummary
 from services.contract_service import ContractResolutionService
@@ -449,6 +449,9 @@ class IBConnector:
 
     def _check_pending_bags(self):
         return self.market_data_service.check_pending_bags()
+
+    def _check_pending_single_legs(self):
+        return self.market_data_service.check_pending_single_legs()
 
     def get_readable_contract_name(self, contract: Contract) -> str:
         return self.contract_service.get_readable_contract_name(contract)

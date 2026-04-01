@@ -4,8 +4,9 @@ from typing import Dict, Any, List, Optional
 from ibapi.contract import Contract, ComboLeg
 from .base_service import IBBaseService
 from utils import (
-    create_contract, get_exchange_for_product, clean_float, 
-    parse_single_leg_details, parse_contract_symbol
+    create_contract, clean_float, 
+    parse_single_leg_details, parse_contract_symbol,
+    calculate_display_price
 )
 
 class MarketDataService(IBBaseService):
@@ -13,6 +14,8 @@ class MarketDataService(IBBaseService):
         super().__init__(connector)
         # Tick Buffer for Throttling
         self.pending_bags: List[Dict] = []
+        # Contracts waiting for exchange resolution before reqMktData
+        self.pending_single_leg_subscriptions: List[Contract] = []
         # Cache for BAG Calculation Throttling: gConId -> {Leg_gConId: {BID: ..., ASK: ..., LAST: ...}}
         self._last_bag_leg_states: Dict[str, Dict[str, Dict[str, float]]] = {}
 
@@ -28,7 +31,11 @@ class MarketDataService(IBBaseService):
             c.localSymbol = details.get('localSymbol', '')
             c.secType = details.get('secType', 'FUT')
             c.currency = details.get('currency', 'USD')
-            c.exchange = details.get('exchange', get_exchange_for_product(c.symbol))
+            
+            # Resolve exchange (use cache first)
+            resolved_exchange = self.connector.contract_service.resolve_product_exchange(c)
+            
+            c.exchange = resolved_exchange or ""
             c.lastTradeDateOrContractMonth = details.get('expiry', '')
             c.multiplier = details.get('multiplier', '')
             c.primaryExchange = details.get('primaryExchange', '')
@@ -69,7 +76,7 @@ class MarketDataService(IBBaseService):
 
             # Ensure exchange is set for single-leg subscriptions
             if not contract.exchange:
-                contract.exchange = get_exchange_for_product(product or contract.symbol)
+                contract.exchange = self.connector.contract_service.resolve_product_exchange(contract) or ""
         else:
             contract = contract_data
             legs = None
@@ -89,7 +96,7 @@ class MarketDataService(IBBaseService):
                 
                 # Ensure exchange is set for single-leg subscriptions
                 if not contract.exchange:
-                    contract.exchange = get_exchange_for_product(product or contract.symbol)
+                    contract.exchange = self.connector.contract_service.resolve_product_exchange(contract) or ""
             else:
                  product = month = year = ""
 
@@ -142,11 +149,19 @@ class MarketDataService(IBBaseService):
 
             if reg_legs:
                 for l in reg_legs:
+                    # Try to resolve exchange for leg
+                    l_exc = l.get('exchange')
+                    if not l_exc:
+                         # Create temporary contract for cache check
+                         ltmp = Contract()
+                         ltmp.symbol = l.get('symbol')
+                         l_exc = self.connector.contract_service.resolve_product_exchange(ltmp) or ""
+                    
                     leg_contract_info = {
                         "symbol": l.get('symbol'),
                         "secType": l.get('secType', 'FUT'),
                         "lastTradeDateOrContractMonth": l.get('expiry') or l.get('lastTradeDateOrContractMonth'),
-                        "exchange": l.get('exchange', get_exchange_for_product(l.get('symbol'))),
+                        "exchange": l_exc,
                         "currency": l.get('currency', 'USD'),
                         "strike": l.get('strike', 0.0),
                         "right": l.get('right', '')
@@ -177,7 +192,15 @@ class MarketDataService(IBBaseService):
                         clem.conId = l_conid
                         clem.ratio = l.get('ratio', 1)
                         clem.action = l.get('action', 'BUY')
-                        clem.exchange = l.get('exchange', get_exchange_for_product(l_name))
+                        
+                        # Resolve leg exchange
+                        l_exc = l.get('exchange')
+                        if not l_exc:
+                             ltmp = Contract()
+                             ltmp.conId = l_conid
+                             ltmp.symbol = l_name
+                             l_exc = self.connector.contract_service.resolve_product_exchange(ltmp) or ""
+                        clem.exchange = l_exc
                         combo_legs.append(clem)
                     else:
                         all_resolved = False
@@ -206,6 +229,24 @@ class MarketDataService(IBBaseService):
             return 
             
         # Single-Leg Subscription
+        # 1. Ensure exchange is present (Automated Resolution)
+        if not contract.exchange:
+            resolved_exchange = self.connector.contract_service.resolve_product_exchange(contract)
+            if resolved_exchange:
+                contract.exchange = resolved_exchange
+            else:
+                # Still missing - defer and trigger IB resolution
+                self.logger.info(f"Deferring subscription for {contract.symbol} {contract.localSymbol}... resolving exchange.")
+                if contract not in self.pending_single_leg_subscriptions:
+                    self.pending_single_leg_subscriptions.append(contract)
+                
+                # Trigger resolution
+                if contract.conId:
+                    self.connector.resolve_contract_by_conid(contract.conId)
+                else:
+                    self.connector.contract_service.resolve_watchlist_symbols([contract.symbol])
+                return
+
         req_id = self.connector.get_req_id()
         
         with self.connector.lock:
@@ -235,6 +276,26 @@ class MarketDataService(IBBaseService):
              
         self.logger.info(f"Subscribing to reqMktData {self.connector.req_id_to_symbol.get(req_id, 'Unknown')} (ReqId: {req_id}, gConId: {g_con_id})...")
         self.connector.client.reqMktData(req_id, contract, "", False, False, [])
+
+    def check_pending_single_legs(self):
+        """
+        Finalizes subscriptions for single-leg contracts that were waiting for metadata resolution.
+        """
+        if not self.pending_single_leg_subscriptions:
+            return
+            
+        still_pending = []
+        for contract in self.pending_single_leg_subscriptions:
+            # Check if now we have the exchange resolved
+            resolved_exchange = self.connector.contract_service.resolve_product_exchange(contract)
+            if resolved_exchange:
+                contract.exchange = resolved_exchange
+                self.logger.info(f"Finalizing deferred subscription for {contract.symbol} (Exchange: {resolved_exchange})")
+                self.subscribe_contract(contract)
+            else:
+                still_pending.append(contract)
+        
+        self.pending_single_leg_subscriptions = still_pending
 
     def check_pending_bags(self):
         """
@@ -548,11 +609,17 @@ class MarketDataService(IBBaseService):
                           self.logger.info(f"Sync Request: Calculating BAG price for {symbol_str}...")
                           p = self.connector.db_client.get_realtime_synthetic_price(reg_legs)
                           if any(v is not None for v in p.values()):
-                              final_price = p
-                              break
+                               display_price = calculate_display_price(p)
+                               if display_price and (not p.get('last') or p.get('last') <= 0):
+                                   p['last'] = display_price
+                               final_price = p
+                               break
             else:
                 p = self.connector.db_client.latest_prices.get(g_con_id)
                 if p and any(v > 0 for v in p.values() if isinstance(v, (int, float))):
+                    display_price = calculate_display_price(p)
+                    if display_price and (not p.get('LAST') or p.get('LAST') <= 0):
+                        p['LAST'] = display_price
                     self.logger.info(f"Sync Request: Ticks received for {symbol_str}: {p}")
                     final_price = p
                     break

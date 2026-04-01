@@ -232,7 +232,12 @@ class IBWrapper(EWrapper):
             }
             # print(f"DEBUG: Cache Updated for {contractDetails.contract.conId}: Local='{contractDetails.contract.localSymbol}'")
             
+            # Populate Product Exchange Cache for instant future resolution
+            if contractDetails.contract.symbol and contractDetails.contract.exchange:
+                 self.app_context.contract_service.product_exchange_cache[contractDetails.contract.symbol] = contractDetails.contract.exchange
+
             # Re-trigger pending subscriptions and pricing (BAGs might be waiting for this leg)
+            self.app_context._check_pending_single_legs()
             self.app_context._check_pending_bags()
             self.app_context._update_dependent_bags_by_conid(contractDetails.contract.conId)
 
