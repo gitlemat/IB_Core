@@ -537,9 +537,9 @@ async def get_contract_sync(symbol: str, request: Request):
     # We use a 6 second timeout to be safe within typical HTTP limits (though request might timeout sooner if not configured)
     data = connector.get_sync_contract_data(symbol, timeout=6.0)
     
-    if data.get("error"):
-         # 408 Request Timeout is appropriate
-         raise HTTPException(status_code=408, detail=data["error"])
+    # We don't raise an exception on 'error' (like timeout) anymore, because 
+    # we want to return the contract metadata even if ticks are missing.
+    # The client can check for 'ticks' null or 'error' key.
          
     # Sanitize floats and normalize keys to lowercase
     if data.get("ticks"):
@@ -547,8 +547,36 @@ async def get_contract_sync(symbol: str, request: Request):
         for k, v in data["ticks"].items():
             normalized_ticks[k.lower()] = clean_float(v)
         data["ticks"] = normalized_ticks
+        
+    # Sanitize legs ticks
+    if data.get("legs"):
+        for leg in data["legs"]:
+            if leg.get("ticks"):
+                norm_leg_ticks = {}
+                for k, v in leg["ticks"].items():
+                    norm_leg_ticks[k.lower()] = clean_float(v)
+                leg["ticks"] = norm_leg_ticks
             
     return data
+
+@router.get("/Contract/SyncActive/{product}", summary="Descubre todos los contratos activos de un producto")
+async def get_active_contracts(product: str, request: Request, secType: str = Query("FUT")):
+    """
+    Busca y devuelve una lista de todos los contratos activos para un producto (p.ej. HE, LE).
+    Bloquea hasta que todos los detalles han sido recibidos de IB.
+    """
+    connector = get_connector(request)
+    connector.logger.info(f"API: Discovering all active '{secType}' for product: {product}")
+    
+    # Timeout at 12 seconds to be safe (IB discovery can be slow for many expirations)
+    results = connector.contract_service.resolve_all_contracts_sync(product, sec_type=secType, timeout=12.0)
+    
+    return {
+        "product": product,
+        "secType": secType,
+        "count": len(results),
+        "contracts": results
+    }
 
 @router.get("/Contract/{gConId}", summary="Obtiene la información de un contrato")
 async def get_contract_info(gConId: str, request: Request, accountId: Optional[str] = Query(None)):

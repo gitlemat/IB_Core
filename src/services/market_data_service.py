@@ -557,12 +557,22 @@ class MarketDataService(IBBaseService):
         pre_existing_cache_keys = set(self.connector.symbol_cache.keys())
         
         legs = parse_contract_symbol(symbol_str)
-        contract_data = {"symbol": symbol_str, "legs": legs}
-        if len(legs) > 1:
-            contract_data["secType"] = "BAG"
+        is_bag = (len(legs) > 1)
+        
+        # Build template contract info
+        if not is_bag and legs:
+            # For single legs, use the parsed components (product, expiry)
+            # instead of just the raw symbol string to satisfy IB requirements
+            contract_data = legs[0].copy()
+            # If the user passed a full-year symbol (e.g. HE26M) instead of short (HEM6)
+            # create_contract will use it.
+        else:
+            contract_data = {"symbol": symbol_str, "legs": legs}
+            if is_bag:
+                contract_data["secType"] = "BAG"
             
         temp_contract = create_contract(contract_data) 
-        if len(legs) > 1:
+        if is_bag:
             temp_contract._metadata_legs = legs
             
         g_con_id = self.connector.contract_service.get_g_con_id(temp_contract)
@@ -585,49 +595,124 @@ class MarketDataService(IBBaseService):
             else:
                 if any(v > 0 for v in cached_price.values() if isinstance(v, (int, float))): has_data = True
                 
-        if has_data:
-            self.logger.info(f"Sync Request: Cache Hit for {symbol_str}. Returning existing data.")
-            return {
-                "conId": temp_contract.conId, 
-                "gConId": g_con_id,
-                "ticks": cached_price
-            }
-            
-        self.logger.info(f"Sync Request: Cache Miss for {symbol_str}. Requesting subscription...")
-        was_already_subscribed = (g_con_id in self.connector.active_subscriptions)
-        self.subscribe_contract(contract_data)
-        
-        start_time = time.time()
         final_price = None
+        needs_resolution = (not is_bag and (not temp_contract.conId or not temp_contract.exchange or not getattr(temp_contract, 'multiplier', 0)))
         
-        while (time.time() - start_time) < timeout:
-            time.sleep(0.2)
-            if is_bag:
-                if g_con_id in self.connector.active_subscriptions:
-                     reg_legs = self.connector.active_subscriptions[g_con_id].get('legs')
-                     if reg_legs:
-                          self.logger.info(f"Sync Request: Calculating BAG price for {symbol_str}...")
-                          p = self.connector.db_client.get_realtime_synthetic_price(reg_legs)
-                          if any(v is not None for v in p.values()):
-                               display_price = calculate_display_price(p)
-                               if display_price and (not p.get('last') or p.get('last') <= 0):
-                                   p['last'] = display_price
-                               final_price = p
-                               break
+        if has_data and not needs_resolution:
+            self.logger.info(f"Sync Request: Cache Hit for {symbol_str}. Using existing data.")
+            final_price = cached_price
+            was_already_subscribed = True 
+        else:
+            self.logger.info(f"Sync Request: Cache Miss or Missing Metadata for {symbol_str}. Requesting subscription...")
+            was_already_subscribed = (g_con_id in self.connector.active_subscriptions)
+            
+            # Synchronous Resolution for new symbols or missing metadata to ensure (conId, multiplier, exchange)
+            if not is_bag and (needs_resolution or not was_already_subscribed):
+                 # Try to resolve exchange from product cache before requesting details
+                 if not temp_contract.exchange:
+                     temp_contract.exchange = self.connector.contract_service.resolve_product_exchange(temp_contract) or ""
+                 
+                 self.connector.contract_service.resolve_contract_details_sync(temp_contract)
+            
+            self.subscribe_contract(contract_data)
+            
+            # Only poll if we don't have data yet (Cache hit on price, but miss on metadata case)
+            if has_data:
+                final_price = cached_price
             else:
-                p = self.connector.db_client.latest_prices.get(g_con_id)
-                if p and any(v > 0 for v in p.values() if isinstance(v, (int, float))):
-                    display_price = calculate_display_price(p)
-                    if display_price and (not p.get('LAST') or p.get('LAST') <= 0):
-                        p['LAST'] = display_price
-                    self.logger.info(f"Sync Request: Ticks received for {symbol_str}: {p}")
-                    final_price = p
-                    break
+                start_time = time.time()
+                while (time.time() - start_time) < timeout:
+                    time.sleep(0.2)
+                    if is_bag:
+                        if g_con_id in self.connector.active_subscriptions:
+                             reg_legs = self.connector.active_subscriptions[g_con_id].get('legs')
+                             if reg_legs:
+                                  # self.logger.info(f"Sync Request: Calculating BAG price for {symbol_str}...")
+                                  p = self.connector.db_client.get_realtime_synthetic_price(reg_legs)
+                                  if any(v is not None for v in p.values()):
+                                       display_price = calculate_display_price(p)
+                                       if display_price and (not p.get('last') or p.get('last') <= 0):
+                                           p['last'] = display_price
+                                       final_price = p
+                                       break
+                    else:
+                        p = self.connector.db_client.latest_prices.get(g_con_id)
+                        if p and any(v > 0 for v in p.values() if isinstance(v, (int, float))):
+                            display_price = calculate_display_price(p)
+                            if display_price and (not p.get('LAST') or p.get('LAST') <= 0):
+                                p['LAST'] = display_price
+                            # self.logger.info(f"Sync Request: Ticks received for {symbol_str}: {p}")
+                            final_price = p
+                            break
+                
+                if final_price:
+                    self.logger.info(f"Sync Request: Data received for {symbol_str} after {(time.time() - start_time):.2f}s")
         
-        if final_price:
-            self.logger.info(f"Sync Request: Data received for {symbol_str} after {(time.time() - start_time):.2f}s")
-            final_price = p # Added to be explicit though p is already set if break happened correctly
+        # --- Building Expanded Response ---
+        legs_response = []
         
+        # Determine legs for response (Single or BAG)
+        if is_bag:
+            # For BAGs, we already have the reg_legs from sync loop above if successful
+            target_legs = []
+            if g_con_id in self.connector.active_subscriptions:
+                target_legs = self.connector.active_subscriptions[g_con_id].get('legs', [])
+            
+            # If no registered legs yet (timeout case), fallback to parsed legs
+            if not target_legs:
+                for l in legs:
+                    target_legs.append({
+                        "symbol": l.get('symbol'),
+                        "ratio": l.get('ratio', 1),
+                        "action": l.get('action', 'BUY'),
+                        # Minimal info for fallback
+                    })
+            
+            # Use expand_bag_legs to get full metadata (conId, symbol, multiplier, ticks etc.)
+            expanded = self.expand_bag_legs(temp_contract, target_legs)
+            for l_data in expanded:
+                # Map internal keys to user requested keys
+                leg_item = {
+                    "conId": l_data.get("conId"),
+                    "symbol": l_data.get("symbol"),
+                    "lastTradeDateOrContractMonth": l_data.get("lastTradeDateOrContractMonth", ""),
+                    "exchange": l_data.get("exchange", ""),
+                    "multiplier": l_data.get("multiplier", 1.0),
+                    "ticks": {
+                        "bid": l_data.get("bid"),
+                        "ask": l_data.get("ask"),
+                        "last": l_data.get("last")
+                    }
+                }
+                legs_response.append(leg_item)
+        else:
+            # Single-Leg logic
+            # Get multiplier from connector (handles normalization)
+            multiplier = self.connector.get_contract_multiplier(temp_contract)
+            
+            # Check if we have more specific details from cache (e.g. after resolution)
+            res_conid = temp_contract.conId
+            res_exchange = temp_contract.exchange
+            res_last_date = temp_contract.lastTradeDateOrContractMonth
+            
+            if not res_conid and g_con_id in self.connector.active_subscriptions:
+                sub_c = self.connector.active_subscriptions[g_con_id].get('contract')
+                if sub_c:
+                    res_conid = getattr(sub_c, 'conId', None)
+                    res_exchange = sub_c.exchange
+                    res_last_date = sub_c.lastTradeDateOrContractMonth
+
+            leg_item = {
+                "conId": res_conid,
+                "symbol": symbol_str,
+                "lastTradeDateOrContractMonth": res_last_date,
+                "exchange": res_exchange,
+                "multiplier": multiplier,
+                "ticks": final_price if final_price else None
+            }
+            legs_response.append(leg_item)
+
+        # --- Stateless Cleanup ---
         if not was_already_subscribed:
             self.logger.info(f"Sync Request: Cleaning up stateless subscription for {symbol_str}")
             created_con_ids = []
@@ -652,12 +737,25 @@ class MarketDataService(IBBaseService):
                     if cid not in pre_existing_cache_keys and cid in self.connector.symbol_cache:
                         self.logger.info(f"Cleaning up resolved cache for conId: {cid}")
                         del self.connector.symbol_cache[cid]
-            
+
         if final_price:
-            return {"conId": temp_contract.conId, "gConId": g_con_id, "ticks": final_price}
+            return {
+                "conId": temp_contract.conId, 
+                "gConId": g_con_id, 
+                "secType": temp_contract.secType,
+                "ticks": final_price, 
+                "legs": legs_response
+            }
         else:
             self.logger.warning(f"Sync Request: TIMEOUT for {symbol_str} after {timeout}s.")
-            return {"conId": temp_contract.conId, "gConId": g_con_id, "ticks": None, "error": "Timeout waiting for market data"}
+            return {
+                "conId": temp_contract.conId, 
+                "gConId": g_con_id, 
+                "secType": temp_contract.secType,
+                "legs": legs_response,
+                "ticks": None, 
+                "error": "Timeout waiting for market data"
+            }
 
     def _find_g_con_id_by_con_id(self, con_id: int) -> Optional[str]:
         for gid, sub in self.connector.active_subscriptions.items():

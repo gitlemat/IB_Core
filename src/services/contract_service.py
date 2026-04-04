@@ -1,5 +1,6 @@
 from typing import Dict, Any, List, Optional
 import threading
+import time
 from ibapi.contract import Contract, ComboLeg
 from .base_service import IBBaseService
 from utils import parse_contract_symbol, get_short_symbol, generate_g_con_id
@@ -152,6 +153,100 @@ class ContractResolutionService(IBBaseService):
             full_str = full_str[1:]
             
         return full_str
+
+    def resolve_contract_details_sync(self, contract: Contract, timeout: float = 5.0) -> bool:
+        """
+        Synchronously requests contract details and waits for the result.
+        Populates the input contract object with resolved metadata if successful.
+        """
+        if contract.conId and contract.exchange and contract.multiplier:
+            return True # Already has basic metadata
+            
+        req_id = self.connector.get_req_id()
+        event = threading.Event()
+        self.connector.resolution_events[req_id] = event
+        
+        # Log exactly what we are sending for debugging
+        self.logger.info(f"Sync Resolution {req_id}: Sending request for Symbol='{contract.symbol}', Expiry='{contract.lastTradeDateOrContractMonth}', SecType='{contract.secType}', Exchange='{contract.exchange}'")
+        self.connector.client.reqContractDetails(req_id, contract)
+        
+        start_wait = time.time()
+        was_notified = event.wait(timeout=timeout)
+        wait_duration = time.time() - start_wait
+        
+        if was_notified:
+            # Check wrapper for the resolved details
+            details = self.connector.wrapper.contract_details.get(req_id)
+            if details:
+                # Update the original contract object with resolved details
+                contract.conId = details.contract.conId
+                contract.exchange = details.contract.exchange
+                contract.multiplier = details.contract.multiplier
+                contract.lastTradeDateOrContractMonth = details.contract.lastTradeDateOrContractMonth
+                contract.symbol = details.contract.symbol
+                contract.localSymbol = details.contract.localSymbol
+                self.logger.info(f"Sync Resolution {req_id}: Success after {wait_duration:.2f}s for '{contract.symbol}' -> ConId:{contract.conId}")
+                return True
+            else:
+                # If event was set but no details found, it's likely an error that was handled in on_error
+                error_msg = self.connector.wrapper.last_errors.get(req_id, "Unknown Connection Error")
+                self.logger.warning(f"Sync Resolution {req_id}: FAILED after {wait_duration:.2f}s for '{contract.symbol}': {error_msg}")
+                return False
+        
+        self.logger.warning(f"Sync Resolution {req_id}: TIMEOUT after {wait_duration:.2f}s (no response from IB) for '{contract.symbol}'")
+        return False
+
+    def resolve_all_contracts_sync(self, product: str, sec_type: str = "FUT", timeout: float = 10.0) -> List[Dict]:
+        """
+        Broadly requests all contracts for a product code and waits for all results.
+        Returns a list of simplified contract dictionaries.
+        """
+        contract = Contract()
+        contract.symbol = product
+        contract.secType = sec_type
+        contract.currency = "USD" # Default, usually fine for futures
+        
+        # Try to resolve exchange to narrow search if possible, else empty for broad search
+        contract.exchange = self.resolve_product_exchange(contract) or ""
+        
+        req_id = self.connector.get_req_id()
+        event = threading.Event()
+        self.connector.resolution_events[req_id] = event
+        
+        # Ensure we have a fresh list in bulk_contract_details
+        self.connector.wrapper.bulk_contract_details[req_id] = []
+        
+        self.logger.info(f"Sync Discovery {req_id}: Requesting all '{sec_type}' for product '{product}' (Exchange: '{contract.exchange}')")
+        self.connector.client.reqContractDetails(req_id, contract)
+        
+        start_wait = time.time()
+        was_notified = event.wait(timeout=timeout)
+        wait_duration = time.time() - start_wait
+        
+        # Retrieve the accumulated results
+        results = self.connector.wrapper.bulk_contract_details.pop(req_id, [])
+        
+        final_list = []
+        for details in results:
+            c = details.contract
+            final_list.append({
+                "conId": c.conId,
+                "symbol": c.symbol,
+                "localSymbol": c.localSymbol,
+                "expiry": c.lastTradeDateOrContractMonth,
+                "multiplier": c.multiplier,
+                "exchange": c.exchange,
+                "currency": c.currency,
+                "longName": details.longName,
+                "marketName": details.marketName
+            })
+            
+        if was_notified:
+            self.logger.info(f"Sync Discovery {req_id}: Found {len(final_list)} contracts in {wait_duration:.2f}s")
+        else:
+            self.logger.warning(f"Sync Discovery {req_id}: TIMEOUT after {wait_duration:.2f}s. Returning partial list of {len(final_list)} contracts.")
+            
+        return final_list
 
     def resolve_contract_by_conid(self, con_id: int):
         """

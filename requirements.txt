@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pandas
+influxdb-client
+python-dotenv
+# ibapi is local but we can add its dependencies if any (usually just python)

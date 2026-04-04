@@ -133,7 +133,9 @@ def create_contract(data: Dict[str, Any]) -> Contract:
     def s(val): return val if val is not None else ""
 
     contract = Contract()
-    contract.symbol = s(data.get('symbol', ''))
+    # IB expects the root symbol (product) like 'HE' for futures, 
+    # not the full legacy string like 'HEV6'.
+    contract.symbol = s(data.get('product', data.get('symbol', '')))
     contract.secType = s(data.get('secType', 'FUT'))
     
     contract.exchange = s(data.get('exchange', ''))

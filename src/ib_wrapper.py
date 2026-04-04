@@ -46,8 +46,12 @@ class IBWrapper(EWrapper):
         self.account_summary: Dict[str, Dict[str, str]] = {}
         # Stores {orderId: {'order': Order, 'contract': Contract, 'state': OrderState}}
         self.open_orders: Dict[int, Dict] = {}
-        self.order_statuses: Dict[int, Any] = {}
         self.contract_details: Dict[int, ContractDetails] = {}
+        # Stores {reqId: [ContractDetails, ...]} for discovering all active contracts for a product
+        self.bulk_contract_details: Dict[int, List[ContractDetails]] = {}
+        self.order_statuses: Dict[int, Any] = {}
+        # Stores {reqId: "errorCode: errorString"} for retrieval during sync calls
+        self.last_errors: Dict[int, str] = {}
         
         # This will hold the reference to the main app to send data to Influx
         # In a real app, use a proper signal/slot or queue mechanism
@@ -74,6 +78,10 @@ class IBWrapper(EWrapper):
             self.logger.info(f"[RECEIVE] IB Notification. Id: {reqId}, Code: {errorCode}, Msg: {errorString}")
         else:
             self.logger.error(f"[RECEIVE] IB Error. Id: {reqId}, Code: {errorCode}, Msg: {errorString}")
+            
+        # Store error for sync-waiters
+        if reqId != -1:
+            self.last_errors[reqId] = f"{errorCode}: {errorString}"
             
         # Forward error to connector to handle blocked requests
         if self.app_context and hasattr(self.app_context, 'on_error'):
@@ -211,6 +219,11 @@ class IBWrapper(EWrapper):
         """
         self.logger.info(f"Contract Details Received. ReqId: {reqId}, Symbol: {contractDetails.contract.symbol}, LocalSymbol: {contractDetails.contract.localSymbol}, Multiplier: {contractDetails.contract.multiplier}, ConId: {contractDetails.contract.conId}")
         self.contract_details[reqId] = contractDetails
+        
+        # Append to bulk results for SyncActive discovery
+        if reqId not in self.bulk_contract_details:
+             self.bulk_contract_details[reqId] = []
+        self.bulk_contract_details[reqId].append(contractDetails)
         
         # Populate Symbol Cache in App Context
         # We store True/Local Symbol to help naming
