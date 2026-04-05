@@ -353,16 +353,16 @@ def calculate_display_price(ticks: Dict[str, Any]) -> Optional[float]:
     bid = clean_float(bid)
     ask = clean_float(ask)
     
-    if last and last > 0:
+    if last is not None:
         return last
         
-    if bid and ask and bid > 0 and ask > 0:
+    if bid is not None and ask is not None:
         return (bid + ask) / 2
         
-    if bid and bid > 0:
+    if bid is not None:
         return bid
         
-    if ask and ask > 0:
+    if ask is not None:
         return ask
         
     return None

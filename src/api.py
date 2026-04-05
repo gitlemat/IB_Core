@@ -491,6 +491,10 @@ async def list_unique_contracts(request: Request, accountId: Optional[str] = Que
         readable_symbol = connector.get_readable_contract_name(contract)
         
         # Pricing (Unified Cache)
+        if contract.secType == "BAG" and g_con_id not in connector.db_client.latest_prices:
+            # Proactively calculate if cache is empty on startup
+            connector.market_data_service.recalculate_bag_price(g_con_id, data)
+            
         prices = connector.db_client.latest_prices.get(g_con_id, {})
         bid = prices.get('BID')
         ask = prices.get('ASK')

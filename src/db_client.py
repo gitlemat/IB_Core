@@ -945,19 +945,26 @@ class DatabaseClient:
             l_last = prices.get('LAST')
             if (l_last or 0.0) <= 0.0: l_last = None
             
-            # --- Fallback: If no live prices, try to get the last known price from InfluxDB ---
-            if l_bid is None and l_ask is None and l_last is None:
+            # --- Fallback: If any live prices are missing, try to get them from InfluxDB ---
+            if l_bid is None or l_ask is None or l_last is None:
                 leg_symbol = leg.get('symbol')
-                self.logger.debug(f"BAG Calculation: No live data for leg {leg_symbol}. Attempting DB fallback.")
                 
                 # Query by human-readable symbol if available (it's what GUI uses and it works)
                 db_record = self.get_last_price_record(leg_symbol or l_gconid)
                 if db_record:
-                    l_last = db_record.get('LAST')
-                    if (l_last or 0.0) <= 0.0: l_last = None
-                    # Use last as fallback for bid/ask too if needed for math
-                    l_bid = db_record.get('BID') or l_last
-                    l_ask = db_record.get('ASK') or l_last
+                    if l_last is None:
+                        db_last = db_record.get('LAST')
+                        if (db_last or 0.0) > 0.0: l_last = db_last
+                        
+                    if l_bid is None:
+                        db_bid = db_record.get('BID')
+                        if (db_bid or 0.0) > 0.0: l_bid = db_bid
+                        else: l_bid = l_last # Use last as fallback for bid
+                    
+                    if l_ask is None:
+                        db_ask = db_record.get('ASK')
+                        if (db_ask or 0.0) > 0.0: l_ask = db_ask
+                        else: l_ask = l_last # Use last as fallback for ask
             
             # Fail fast only if EVEN the DB fallback failed
             if l_bid is None and l_ask is None and l_last is None:
